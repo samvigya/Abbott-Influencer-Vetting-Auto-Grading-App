@@ -1,10 +1,13 @@
 """
-Abbott Influencer Vetting — Auto-Grading App
-============================================
-Upload the AI-processed Excel file → get fully scored grading sheets + master summary.
+Abbott Influencer Vetting — Auto-Grading App  v2.0
+===================================================
+Upload the AI-processed Excel file → get fully scored grading sheets.
 
-Scoring logic based on: Abbott Influencer Vetting Framework V4 (26 Feb 2026)
-Use case: ADULT NUTRITION (Ensure / Glucerna)
+Supports TWO use cases (auto-detected, manual override available):
+  • Pediatric Nutrition  (Similac / PediaSure) — Kids Presence scoring
+  • Adult Nutrition      (Ensure / Glucerna)   — Adult Health topics scoring
+
+Scoring logic: Abbott Influencer Vetting Framework V4 (26 Feb 2026)
 """
 
 import streamlit as st
@@ -13,1045 +16,763 @@ import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from io import BytesIO
-import re
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCORING CONFIGURATION — edit here if thresholds change
+# RISK SCORING CONFIG  (same for both use cases)
 # ─────────────────────────────────────────────────────────────────────────────
-
+# (column_in_AI_file, label_in_grading, yellow_thresh, red_thresh)
 RISK_PARAMS = [
-    # (column_in_AI_file,            label_in_output,        yellow_thresh, red_thresh)
-    ("Profanity Usage",              "Profanity Usage",        0.15,          0.30),
-    ("Alcohol Use Discussion",       "Alcohol",                0.05,          0.15),
-    ("Sensitive Visual Content",     "Sensitive Content",      None,          0.20),   # no yellow
-    ("Stereotypes or Bias",          "Stereotype & Bias",      0.05,          0.15),
-    ("Violence Advocacy",            "Violence Content",       0.0001,        0.05),   # any = yellow
-    ("Political Stance",             "Political",              0.10,          0.25),
-    ("Unscientific Claims",          "Unscientific",           None,          0.15),   # no yellow
-    ("Ultra-processed food",         "Ultra-processed Food",   0.15,          0.30),
+    ("Profanity Usage",         "Profanity",         0.15,   0.30),
+    ("Alcohol Use Discussion",  "Alcohol",           0.05,   0.15),
+    ("Sensitive Visual Content","Sensitive content", None,   0.20),
+    ("Stereotypes or Bias",     "Stereotype & Bias", 0.05,   0.15),
+    ("Violence Advocacy",       "Violence Content",  0.0001, 0.05),
+    ("Political Stance",        "Political",         0.10,   0.25),
+    ("Unscientific Claims",     "Unscientific",      None,   0.15),
+    ("Ultra-processed food",    "Ultra-processed Food", 0.15, 0.30),
 ]
 
-AUTO_REJECT_MAP = {
-    "Substance Use Discussion": "Substance Use",
-    "Breastfeeding":            "Anti-breastfeeding",
-    "Vaccination":              "Anti-vaccination",
-    "Health care stance":       "Anti-healthcare",
-}
-
-RELEVANCE_PARAMS = [
-    # (column_in_AI_file,                label,                       points, any_count_triggers)
-    ("Topics around Adult Health",       "Topics Adult Health",        5.0,   True),
-    ("Topics on Adult Healthy Nutrition","Topics Adult Nutrition",     2.0,   True),
-    ("Media Presence & Awards",          "Awards/Media Presence",      1.0,   True),
-    ("Brand Partnership Presence",       "Relevant Brand Partnerships",1.0,   True),
+# Auto-reject gates: (AI_column, grading_label)
+AUTO_REJECT_GATES = [
+    ("Substance Use Discussion", "Substance Use"),
+    ("Breastfeeding",            "Anti-breastfeeding"),
+    ("Vaccination",              "Anti-vaccination"),
+    ("Health care stance",       "Anti-healthcare"),
 ]
-
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def risk_points(pct, yellow_thresh, red_thresh):
-    """Return 0 / 0.5 / 1.0 based on % prevalence."""
+def risk_points(pct, y_thresh, r_thresh):
     if pct is None or (isinstance(pct, float) and pd.isna(pct)):
         return 0.0
     pct = float(pct)
-    if pct >= red_thresh:
+    if pct >= r_thresh:
         return 1.0
-    if yellow_thresh is not None and pct >= yellow_thresh:
+    if y_thresh is not None and pct >= y_thresh:
         return 0.5
     return 0.0
 
+def safe_val(df, row_idx, col):
+    try:
+        if col in df.columns:
+            v = df.iloc[row_idx][col]
+            return float(v) if not pd.isna(v) else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+def get_count(df, col):   return safe_val(df, 0, col)
+def get_total(df, col):   return safe_val(df, 1, col)
 
 def safe_pct(count, total):
-    """Calculate % safely."""
     try:
         c, t = float(count), float(total)
         return c / t if t > 0 else 0.0
     except Exception:
         return 0.0
 
-
-def get_count(df, col):
-    """Get YES count from row 0 for standard AI sheets."""
-    try:
-        if col in df.columns:
-            val = df.iloc[0][col]
-            return float(val) if not pd.isna(val) else 0.0
-    except Exception:
-        pass
-    return 0.0
-
-
-def get_total(df, col):
-    """Get total videos from row 1 for standard AI sheets."""
-    try:
-        if col in df.columns:
-            val = df.iloc[1][col]
-            return float(val) if not pd.isna(val) else 0.0
-    except Exception:
-        pass
-    return 0.0
-
-
 def captions_col_map(df):
-    """
-    Captions sheets have actual column names in row 4 (index 4).
-    Build a mapping: field_name → pandas_column.
-    """
+    """Captions sheets: real headers are in row index 4."""
     mapping = {}
     if len(df) > 4:
-        header_row = df.iloc[4]
-        for pandas_col, value in header_row.items():
-            if pd.notna(value):
-                mapping[str(value).strip()] = pandas_col
+        for col, val in df.iloc[4].items():
+            if pd.notna(val):
+                mapping[str(val).strip()] = col
     return mapping
 
-
-def captions_count(df, field_name, col_map):
-    """Get count from captions sheet using the header-in-row-4 pattern."""
-    pandas_col = col_map.get(field_name)
-    if pandas_col is None:
-        return 0.0, 0.0
+def captions_get(df, field, col_map, row_idx):
+    col = col_map.get(field)
+    if col is None:
+        return 0.0
     try:
-        count = float(df.iloc[0][pandas_col]) if not pd.isna(df.iloc[0][pandas_col]) else 0.0
-        total = float(df.iloc[1][pandas_col]) if not pd.isna(df.iloc[1][pandas_col]) else 0.0
-        return count, total
+        v = df.iloc[row_idx][col]
+        return float(v) if not pd.isna(v) else 0.0
     except Exception:
-        return 0.0, 0.0
+        return 0.0
 
+def extract_kids_age_summary(df):
+    """Collect unique kids age groups from raw data rows."""
+    try:
+        col = "Kids Age Group"
+        if col not in df.columns:
+            return ""
+        skip = {"HEADER", "Total Videos Processed", "% Prevelance", "nan", "None", ""}
+        ages = df[col].dropna().astype(str).tolist()
+        unique = sorted({a.strip() for a in ages if a.strip() not in skip})
+        return ", ".join(unique) if unique else ""
+    except Exception:
+        return ""
 
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SCORING ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_relevance(topics_health_count, topics_nutrition_count,
-                     pregnant_flag):
+def detect_use_case(xl_sheets):
     """
-    Compute the auto-detectable portion of relevance.
+    Auto-detect use case.
+    Primary signal: if any content sheet has 'Topics around Adult Health' with
+    a numeric count > 0 → Adult Nutrition.
+    Otherwise → Pediatric.
 
-    Auto (from AI data):
-      Topics Around Adult Health       → 5 pts  (any video flagged)
-      Topics on Adult Healthy Nutrition→ 2 pts  (any video flagged)
-      Pregnancy penalty                → -2 pts (any video flagged)
-
-    Manual (None = yellow cell in Excel, human fills in):
-      Abbott Brand Association         → 1 pt
-      Awards / Media Presence          → 1 pt
-      Relevant Brand Partnerships      → 1 pt
-
-    Total auto base = 0–7.  Full max with manual = 0–10 (capped).
+    Rationale: Both use cases may have Kids Presenence column, but only Adult
+    Nutrition sheets have actual non-zero counts in the Topics around Adult Health
+    column. Pediatric sheets have NaN / string 'No' in that column.
     """
-    auto_topics_health    = 5.0 if topics_health_count > 0 else 0.0
-    auto_topics_nutrition = 2.0 if topics_nutrition_count > 0 else 0.0
-    base = auto_topics_health + auto_topics_nutrition
-    if pregnant_flag:
-        base = max(0.0, base - 2.0)
-    return {
-        "Topics Adult Health":          auto_topics_health,
-        "Topics Adult Nutrition":       auto_topics_nutrition,
-        # Manual fields — None renders as yellow empty cell in Excel
-        "Abbott Brand Association":     None,
-        "Awards/Media Presence":        None,
-        "Relevant Brand Partnerships":  None,
-        # Auto base (manual fields not yet added)
-        "_auto_base":                   base,
-    }
+    for sheet_name, df in xl_sheets.items():
+        if not (sheet_name.startswith("TT ") or sheet_name.startswith("FB ") or
+                sheet_name.startswith("IG ")):
+            continue
+        if "Topics around Adult Health" in df.columns:
+            try:
+                val = df.iloc[0]["Topics around Adult Health"]
+                if val is not None and str(val) not in ("nan", "None", "No", ""):
+                    if float(val) > 0:
+                        return "Adult"
+            except Exception:
+                pass
+    return "Pediatric"
 
-
-def score_standard_sheet(df, influencer_handle):
+def build_profiles_map(xl_sheets):
     """
-    Score a standard AI sheet (TT / FB / IG).
-    Risk:      fully auto (per-column totals, per Framework V4).
-    Relevance: Topics auto; Abbott / Awards / Brand Partnerships = manual.
+    If a Profiles sheet exists, build handle → full_name mapping.
     """
-    # ── Auto-reject gates ──────────────────────────────────────────────────
-    auto_reject = {}
-    auto_reject_triggered = False
-    for col, label in AUTO_REJECT_MAP.items():
-        count = get_count(df, col)
-        total = get_total(df, col)
-        flagged = 1 if safe_pct(count, total) > 0 else 0
-        auto_reject[label] = flagged
-        if flagged:
-            auto_reject_triggered = True
-
-    # ── 8 risk parameters ─────────────────────────────────────────────────
-    risk_scores = {}
-    total_risk_pts = 0.0
-    for col, label, y_thresh, r_thresh in RISK_PARAMS:
-        count = get_count(df, col)
-        total = get_total(df, col)
-        pts   = risk_points(safe_pct(count, total), y_thresh, r_thresh)
-        risk_scores[label] = pts
-        total_risk_pts += pts
-
-    final_risk = 10.0 if auto_reject_triggered else round((total_risk_pts / 8) * 10, 4)
-
-    # ── Relevance ─────────────────────────────────────────────────────────
-    health_count     = get_count(df, "Topics around Adult Health")
-    nutrition_count  = get_count(df, "Topics on Adult Healthy Nutrition")
-    pregnant_flag    = 1 if get_count(df, "Pregnant") > 0 else 0
-    rel              = _build_relevance(health_count, nutrition_count, pregnant_flag)
-    auto_base        = rel.pop("_auto_base")
-
-    total_videos = get_total(df, "Profanity Usage") or get_total(df, "Alcohol Use Discussion") or 0
-
-    return {
-        "influencer":            influencer_handle,
-        "total_videos":          int(total_videos),
-        **auto_reject,
-        "auto_reject_triggered": 1 if auto_reject_triggered else 0,
-        **risk_scores,
-        "RISK Score":            final_risk,
-        **rel,
-        "Total Relevance Score": round(auto_base, 4),   # updated by Excel SUM formula
-        "Pregnant Or Not":       pregnant_flag,
-    }
-
-
-def score_captions_sheet(df, influencer_handle):
-    """
-    Score a Captions sheet (header row at index 4, counts at row 0/1).
-    Same scoring rules as standard sheets.
-    """
-    col_map = captions_col_map(df)
-    _, total_videos = captions_count(df, "Profanity Usage", col_map)
-
-    # ── Auto-reject gates ──────────────────────────────────────────────────
-    auto_reject = {}
-    auto_reject_triggered = False
-    for col, label in AUTO_REJECT_MAP.items():
-        count, total = captions_count(df, col, col_map)
-        flagged = 1 if safe_pct(count, total) > 0 else 0
-        auto_reject[label] = flagged
-        if flagged:
-            auto_reject_triggered = True
-
-    # ── 8 risk parameters ─────────────────────────────────────────────────
-    risk_scores = {}
-    total_risk_pts = 0.0
-    for col, label, y_thresh, r_thresh in RISK_PARAMS:
-        count, total = captions_count(df, col, col_map)
-        pts = risk_points(safe_pct(count, total), y_thresh, r_thresh)
-        risk_scores[label] = pts
-        total_risk_pts += pts
-
-    final_risk = 10.0 if auto_reject_triggered else round((total_risk_pts / 8) * 10, 4)
-
-    # ── Relevance ─────────────────────────────────────────────────────────
-    h_count, _  = captions_count(df, "Topics around Adult Health",        col_map)
-    n_count, _  = captions_count(df, "Topics on Adult Healthy Nutrition",  col_map)
-    p_count, _  = captions_count(df, "Pregnant",                           col_map)
-    pregnant_flag = 1 if p_count > 0 else 0
-    rel           = _build_relevance(h_count, n_count, pregnant_flag)
-    auto_base     = rel.pop("_auto_base")
-
-    return {
-        "influencer":            influencer_handle,
-        "total_videos":          int(total_videos),
-        **auto_reject,
-        "auto_reject_triggered": 1 if auto_reject_triggered else 0,
-        **risk_scores,
-        "RISK Score":            final_risk,
-        **rel,
-        "Total Relevance Score": round(auto_base, 4),
-        "Pregnant Or Not":       pregnant_flag,
-    }
-
+    mapping = {}
+    for sheet_name, df in xl_sheets.items():
+        if sheet_name.lower() == "profiles":
+            for _, row in df.iterrows():
+                # look for Username and Influencer Name columns
+                handle = None
+                name = None
+                for col in df.columns:
+                    col_l = str(col).lower()
+                    val = str(row[col]).strip() if pd.notna(row[col]) else ""
+                    if "username" in col_l and val:
+                        handle = val
+                    if "influencer name" in col_l and val:
+                        name = val
+                if handle:
+                    mapping[handle] = name or handle
+    return mapping
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHEET DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 PLATFORM_PREFIXES = {
-    "TT ":      "TT",
-    "FB ":      "FB",
-    "IG + YT ": "IG_YT",
-    "IG ":      "IG",
-    "Captions ":"Captions",
+    "TT ":       "TT",
+    "FB ":       "FB",
+    "IG + YT ":  "IG_YT",
+    "IG ":       "IG",
+    "Captions ": "Captions",
 }
 
+SKIP_SHEETS = {
+    "master grading sheet", "tt grading sheet", "ig + yt grading sheet",
+    "fb grading sheet", "captions grading sheet", "grading", "profiles",
+}
 
 def detect_influencer_sheets(xl_sheets):
-    """
-    Parse sheet names → returns dict:
-      platform → list of (sheet_name, influencer_handle)
-    """
     grouped = {"TT": [], "FB": [], "IG_YT": [], "IG": [], "Captions": []}
-    skip = {"master grading", "tt grading", "ig + yt grading",
-            "fb grading", "captions grading", "grading", "profiles"}
-
     for sheet in xl_sheets:
-        if sheet.lower().strip() in skip:
+        if sheet.lower().strip() in SKIP_SHEETS:
             continue
         for prefix, platform in PLATFORM_PREFIXES.items():
             if sheet.startswith(prefix):
                 handle = sheet[len(prefix):].strip()
                 grouped[platform].append((sheet, handle))
                 break
-
     return grouped
 
-
 def extract_username(df):
-    """Try to pull platform_username from the data."""
-    try:
-        col = "platform_username"
+    for col in ("platform_username", "Username"):
         if col in df.columns:
-            vals = df[col].dropna()
+            vals = df[col].dropna().astype(str)
+            vals = vals[~vals.isin(["nan", "HEADER", "Total Videos Processed", "% Prevelance"])]
             if not vals.empty:
-                return str(vals.iloc[0])
-    except Exception:
-        pass
+                return vals.iloc[0]
     return None
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SCORING ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def score_risk(df, is_captions=False, col_map=None):
+    """
+    Returns:
+      auto_reject_flags: dict label → count (from AI)
+      auto_reject_sum:   sum of all flags (>0 means manual review needed)
+      risk_param_scores: dict label → 0/0.5/1.0
+      risk_score:        final 0-10 risk score
+    """
+    auto_reject_flags = {}
+    auto_reject_sum = 0
+
+    for ai_col, label in AUTO_REJECT_GATES:
+        if is_captions:
+            count = captions_get(df, ai_col, col_map, 0)
+            total = captions_get(df, ai_col, col_map, 1)
+        else:
+            count = get_count(df, ai_col)
+            total = get_total(df, ai_col)
+        flag = 1 if count > 0 else 0
+        auto_reject_flags[label] = flag
+        auto_reject_sum += flag
+
+    auto_reject_triggered = auto_reject_sum > 0
+
+    risk_param_scores = {}
+    total_pts = 0.0
+    for ai_col, label, y_thresh, r_thresh in RISK_PARAMS:
+        if is_captions:
+            count = captions_get(df, ai_col, col_map, 0)
+            total = captions_get(df, ai_col, col_map, 1)
+        else:
+            count = get_count(df, ai_col)
+            total = get_total(df, ai_col)
+        pct = safe_pct(count, total)
+        pts = risk_points(pct, y_thresh, r_thresh)
+        risk_param_scores[label] = pts
+        total_pts += pts
+
+    risk_score = 10.0 if auto_reject_triggered else round((total_pts / 8) * 10, 4)
+
+    return auto_reject_flags, auto_reject_sum, risk_param_scores, risk_score
+
+
+def score_relevance_pediatric(df, is_captions=False, col_map=None):
+    """
+    Pediatric relevance:
+      Kids Presence  (AI)    → 3.5 pts
+      Topics around kids     → MANUAL (None)
+      Abbott brands          → MANUAL (None)
+      Awards/Media           → MANUAL (None)
+      Brand Partnerships     → MANUAL (None)
+      Pregnant               → AI flag
+    """
+    if is_captions:
+        kids_count = captions_get(df, "Kids Presenence", col_map, 0)
+        preg_count = captions_get(df, "Pregnant", col_map, 0)
+    else:
+        kids_count = get_count(df, "Kids Presenence")
+        preg_count = get_count(df, "Pregnant")
+
+    kids_pts = 3.5 if kids_count > 0 else 0.0
+    pregnant_flag = 1 if preg_count > 0 else 0
+
+    return {
+        "Kids Presence":             kids_pts,          # AI auto
+        "Topics around kids":        None,              # MANUAL
+        "Abbott brands":             None,              # MANUAL
+        "Awards/Media Presence":     None,              # MANUAL
+        "Relevant Brand Partnerships": None,            # MANUAL
+        "Pregnant Or Not":           pregnant_flag,
+        "_auto_base":                kids_pts,          # base before manual
+        "_kids_age_summary":         extract_kids_age_summary(df) if not is_captions else "",
+    }
+
+
+def score_relevance_adult(df, is_captions=False, col_map=None):
+    """
+    Adult Nutrition relevance:
+      Topics Adult Health    (AI) → 5 pts
+      Topics Adult Nutrition (AI) → 2 pts
+      Abbott brands          → MANUAL (None)
+      Awards/Media           → MANUAL (None)
+      Brand Partnerships     → MANUAL (None)
+      Pregnant               → AI flag
+    """
+    if is_captions:
+        h_count = captions_get(df, "Topics around Adult Health", col_map, 0)
+        n_count = captions_get(df, "Topics on Adult Healthy Nutrition", col_map, 0)
+        preg_count = captions_get(df, "Pregnant", col_map, 0)
+    else:
+        h_count = get_count(df, "Topics around Adult Health")
+        n_count = get_count(df, "Topics on Adult Healthy Nutrition")
+        preg_count = get_count(df, "Pregnant")
+
+    h_pts = 5.0 if h_count > 0 else 0.0
+    n_pts = 2.0 if n_count > 0 else 0.0
+    pregnant_flag = 1 if preg_count > 0 else 0
+    auto_base = h_pts + n_pts - (2.0 if pregnant_flag else 0.0)
+    auto_base = max(0.0, auto_base)
+
+    return {
+        "Topics Adult Health":       h_pts,
+        "Topics Adult Nutrition":    n_pts,
+        "Abbott brands":             None,
+        "Awards/Media Presence":     None,
+        "Relevant Brand Partnerships": None,
+        "Pregnant Or Not":           pregnant_flag,
+        "_auto_base":                auto_base,
+    }
+
+
+def score_sheet(df, handle, use_case, is_captions=False):
+    """Score one influencer sheet. Returns a clean result dict."""
+    col_map = captions_col_map(df) if is_captions else None
+
+    auto_reject_flags, auto_reject_sum, risk_params, risk_score = score_risk(
+        df, is_captions, col_map
+    )
+
+    if use_case == "Pediatric":
+        rel = score_relevance_pediatric(df, is_captions, col_map)
+    else:
+        rel = score_relevance_adult(df, is_captions, col_map)
+
+    total_videos = (
+        get_total(df, "Profanity Usage") or
+        get_total(df, "Alcohol Use Discussion") or 0
+    ) if not is_captions else (
+        captions_get(df, "Profanity Usage", col_map, 1) or 0
+    )
+
+    return {
+        "handle":               handle,
+        "total_videos":         int(total_videos),
+        "auto_reject_flags":    auto_reject_flags,
+        "auto_reject_sum":      auto_reject_sum,
+        "risk_params":          risk_params,
+        "risk_score":           risk_score,
+        "relevance":            rel,
+        "use_case":             use_case,
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXCEL OUTPUT BUILDER
+# EXCEL STYLES
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Colors
-C_HEADER_DARK  = "1F3864"   # dark navy
-C_HEADER_MID   = "2E75B6"   # mid blue
-C_HEADER_LIGHT = "D6E4F0"   # light blue
-C_GREEN_BG     = "C6EFCE"   # risk green
-C_YELLOW_BG    = "FFEB9C"   # manual / amber
-C_RED_BG       = "FFC7CE"   # risk red
-C_WHITE        = "FFFFFF"
-C_GREY_BG      = "F2F2F2"
-C_ORANGE_BG    = "FCE4D6"   # auto-reject warning
-C_MANUAL_BG    = "FFF2CC"   # yellow for manual-entry cells
+FN = "Arial"
 
-FONT_NAME = "Arial"
+# Colours
+C_NAV    = "1F3864"   # dark navy
+C_DKRED  = "C00000"   # dark red (auto-reject headers)
+C_RED_H  = "FF0000"   # bright red (risk headers / triggered)
+C_DKGRN  = "375623"   # dark green (relevance headers)
+C_BLUE   = "2E75B6"   # mid blue (risk param headers)
+C_MANUAL = "FFEB9C"   # yellow (manual entry)
+C_GREEN  = "C6EFCE"   # green (pass)
+C_AMBER  = "FFEB9C"   # amber (review)
+C_RED    = "FFC7CE"   # red (fail)
+C_GREY   = "F2F2F2"   # alternating row
+C_NAME   = "D9E1F2"   # name cell background
 
+def fp(hex_c):  return PatternFill("solid", fgColor=hex_c)
 
-def hdr_font(bold=True, color="FFFFFF", size=10):
-    return Font(name=FONT_NAME, bold=bold, color=color, size=size)
-
-
-def cell_font(bold=False, color="000000", size=10):
-    return Font(name=FONT_NAME, bold=bold, color=color, size=size)
-
-
-def fill(hex_color):
-    return PatternFill("solid", fgColor=hex_color)
-
-
-def thin_border():
+def bdr():
     s = Side(style="thin", color="BFBFBF")
     return Border(left=s, right=s, top=s, bottom=s)
 
+def hfont(color="FFFFFF", bold=True, sz=9):
+    return Font(name=FN, bold=bold, color=color, size=sz)
 
-def center_align(wrap=True):
+def dfont(color="000000", bold=False, sz=9):
+    return Font(name=FN, bold=bold, color=color, size=sz)
+
+def ac(wrap=True):
     return Alignment(horizontal="center", vertical="center", wrap_text=wrap)
 
+def al():
+    return Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-def write_grading_sheet(ws, scores_list, platform_label, is_captions=False):
-    """Write a formatted grading sheet into a worksheet."""
+# ─────────────────────────────────────────────────────────────────────────────
+# GRADING SHEET WRITER
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # ── Title row ──────────────────────────────────────────────────────────
-    ws.row_dimensions[1].height = 30
-    title_cell = ws.cell(1, 1, f"Abbott Influencer Vetting — {platform_label} Grading Sheet")
-    title_cell.font = Font(name=FONT_NAME, bold=True, size=13, color=C_HEADER_DARK)
-    title_cell.alignment = Alignment(horizontal="left", vertical="center")
-
-    # ── Column headers ─────────────────────────────────────────────────────
-    headers = [
-        "Influencer Handle",
-        # Auto-reject
-        "Substance Use",
-        "Worked With Competition\n(Manual Check)",
-        "Anti-breastfeeding",
-        "Anti-vaccination",
-        "Anti-healthcare",
-        "Auto-Reject?\n(Risk=10 if any flag)",
-        # 8 risk params
-        "Profanity Usage",
-        "Alcohol",
-        "Sensitive Content",
-        "Stereotype & Bias",
-        "Violence Content",
-        "Political",
-        "Unscientific",
-        "Ultra-processed Food",
-        "RISK Score\n(0=Clean, 10=Reject)",
-        # Relevance
-        "Topics Adult Health\n(5 pts)",
-        "Topics Adult Nutrition\n(2 pts)",
-        "Abbott Brand Association\n(1 pt)",
-        "Awards / Media Presence\n(1 pt)",
-        "Relevant Brand Partnerships\n(1 pt)",
-        "Total Relevance Score\n(max 10)",
-        "Pregnant Flag",
-    ]
-
-    # Section header spans
-    section_headers = [
-        (1, 1,  ""),
-        (2, 7,  "RISK — AUTO-REJECT GATES"),
-        (8, 15, "RISK — PARAMETER SCORING"),
-        (16, 16,""),
-        (17, 23,"RELEVANCE SCORING"),
-    ]
-
-    ROW_SECTION = 2
-    ROW_HEADER  = 3
-    ROW_DATA    = 4
-
-    # Section row
-    ws.row_dimensions[ROW_SECTION].height = 20
-    for start_col, end_col, label in section_headers:
-        if label:
-            c = ws.cell(ROW_SECTION, start_col, label)
-            c.font = Font(name=FONT_NAME, bold=True, color="FFFFFF", size=10)
-            if start_col <= 7:
-                c.fill = fill("C00000")   # dark red for auto-reject
-            else:
-                c.fill = fill(C_HEADER_MID)
-            c.alignment = center_align()
-            if end_col > start_col:
-                ws.merge_cells(
-                    start_row=ROW_SECTION, start_column=start_col,
-                    end_row=ROW_SECTION, end_column=end_col
-                )
-
-    # Column header row
-    ws.row_dimensions[ROW_HEADER].height = 50
-    for col_idx, hdr in enumerate(headers, 1):
-        c = ws.cell(ROW_HEADER, col_idx, hdr)
-        if col_idx <= 7:
-            c.fill = fill("FF0000") if col_idx > 1 else fill(C_HEADER_DARK)
-            c.font = hdr_font(color="FFFFFF")
-        elif col_idx <= 15:
-            c.fill = fill(C_HEADER_MID)
-            c.font = hdr_font(color="FFFFFF")
-        elif col_idx == 16:
-            c.fill = fill(C_HEADER_DARK)
-            c.font = hdr_font(color="FFFFFF")
-        else:
-            c.fill = fill("375623")
-            c.font = hdr_font(color="FFFFFF")
-        c.alignment = center_align()
-        c.border = thin_border()
-
-    # Column widths
-    col_widths = [22, 14, 22, 18, 16, 16, 18, 14, 12, 15, 15, 14, 12, 14, 18, 14,
-                  16, 18, 20, 18, 22, 14, 14]
-    for i, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    # ── Data rows ──────────────────────────────────────────────────────────
-    for row_offset, score in enumerate(scores_list):
-        row = ROW_DATA + row_offset
-        ws.row_dimensions[row].height = 18
-
-        auto_rej = score.get("auto_reject_triggered", 0)
-        risk_val = score.get("RISK Score", 0)
-        relevance_val = score.get("Total Relevance Score", 0)
-
-        def write_cell(col, value, bg=C_WHITE, bold=False, center=True):
-            c = ws.cell(row, col, value)
-            c.fill = fill(bg)
-            c.font = cell_font(bold=bold)
-            c.border = thin_border()
-            c.alignment = center_align() if center else Alignment(horizontal="left",
-                                                                    vertical="center",
-                                                                    wrap_text=True)
-            return c
-
-        # Col 1: Influencer name
-        write_cell(1, score["influencer"], C_GREY_BG, bold=True, center=False)
-
-        # Cols 2-6: Auto-reject gates (AI-detected)
-        for col_idx, key in enumerate(
-            ["Substance Use", "Anti-breastfeeding", "Anti-vaccination", "Anti-healthcare"],
-            2
-        ):
-            val = score.get(key, 0)
-            bg = "FFC7CE" if val else C_GREEN_BG
-            write_cell(col_idx, val, bg)
-
-        # Col 3: Competition (MANUAL — yellow)
-        c = ws.cell(row, 3, "")
-        c.fill = fill(C_MANUAL_BG)
-        c.border = thin_border()
-        c.alignment = center_align()
-        c.font = cell_font(color="8B4513")
-
-        # Col 7: Auto-reject summary
-        bg7 = "FF0000" if auto_rej else C_GREEN_BG
-        txt7 = "⚠ AUTO-REJECT" if auto_rej else "Pass"
-        c7 = write_cell(7, txt7, bg7, bold=auto_rej)
-        if auto_rej:
-            c7.font = Font(name=FONT_NAME, bold=True, color="FFFFFF", size=10)
-
-        # Cols 8-15: 8 risk parameters
-        risk_param_keys = [
-            "Profanity Usage", "Alcohol", "Sensitive Content",
-            "Stereotype & Bias", "Violence Content", "Political",
-            "Unscientific", "Ultra-processed Food"
-        ]
-        for col_idx, key in enumerate(risk_param_keys, 8):
-            val = score.get(key, 0)
-            if val == 1.0:
-                bg = C_RED_BG
-            elif val == 0.5:
-                bg = C_YELLOW_BG
-            else:
-                bg = C_GREEN_BG
-            write_cell(col_idx, val, bg)
-
-        # Col 16: RISK Score
-        if risk_val == 10:
-            risk_bg = "FF0000"
-            risk_font_color = "FFFFFF"
-        elif risk_val >= 5:
-            risk_bg = "FF0000"
-            risk_font_color = "FFFFFF"
-        elif risk_val > 0:
-            risk_bg = C_YELLOW_BG
-            risk_font_color = "000000"
-        else:
-            risk_bg = C_GREEN_BG
-            risk_font_color = "000000"
-        c16 = write_cell(16, risk_val, risk_bg, bold=True)
-        c16.font = Font(name=FONT_NAME, bold=True, color=risk_font_color, size=10)
-
-        # Cols 17-21: Relevance (AI auto-detected; None = manual for captions)
-        rel_keys = [
-            "Topics Adult Health", "Topics Adult Nutrition",
-            "Abbott Brand Association", "Awards/Media Presence",
-            "Relevant Brand Partnerships"
-        ]
-        for col_idx, key in enumerate(rel_keys, 17):
-            val = score.get(key)
-            if val is None:
-                # Manual field — yellow highlight, empty
-                c = ws.cell(row, col_idx, "")
-                c.fill = fill(C_MANUAL_BG)
-                c.border = thin_border()
-                c.alignment = center_align()
-                c.font = cell_font(color="8B4513")
-            else:
-                bg = C_GREEN_BG if val > 0 else C_WHITE
-                write_cell(col_idx, val, bg)
-
-        # Col 22: Total Relevance — live formula so it recalculates when manual cells filled
-        # Cols: Topics Health=Q(17), Topics Nutrition=R(18), Abbott=S(19), Awards=T(20), Brand=U(21)
-        # Pregnancy penalty is in col 23
-        rel_sum_cols = f"{get_column_letter(17)}{row}:{get_column_letter(21)}{row}"
-        preg_col     = get_column_letter(23)
-        formula = f"=MIN(10,MAX(0,SUM({rel_sum_cols})-IF({preg_col}{row}=1,2,0)))"
-        c22 = ws.cell(row, 22, formula)
-        # Colour based on static auto_base (changes when human fills in manual cells)
-        auto_base = (score.get("Topics Adult Health") or 0) + (score.get("Topics Adult Nutrition") or 0)
-        if score.get("Pregnant Or Not"):
-            auto_base = max(0, auto_base - 2)
-        if auto_base >= 8:
-            rel_bg = C_GREEN_BG
-        elif auto_base >= 4:
-            rel_bg = C_YELLOW_BG
-        else:
-            rel_bg = C_RED_BG
-        c22.fill  = fill(rel_bg)
-        c22.font  = cell_font(bold=True)
-        c22.border = thin_border()
-        c22.alignment = center_align()
-
-        # Col 23: Pregnant flag
-        preg = score.get("Pregnant Or Not", 0)
-        write_cell(23, "⚠ Pregnant" if preg else 0, "FFC7CE" if preg else C_GREEN_BG)
-
-    # ── Legend ────────────────────────────────────────────────────────────
-    legend_row = ROW_DATA + len(scores_list) + 2
-    ws.cell(legend_row, 1, "LEGEND").font = Font(name=FONT_NAME, bold=True, size=10)
-    items = [
-        (C_MANUAL_BG, "Manual check required — fill in before finalising"),
-        (C_GREEN_BG,  "Green = Pass / Clean"),
-        (C_YELLOW_BG, "Amber = Review / Moderate risk"),
-        (C_RED_BG,    "Red = Fail / High risk"),
-    ]
-    for i, (color, text) in enumerate(items):
-        c = ws.cell(legend_row + 1 + i, 1, "")
-        c.fill = fill(color)
-        c.border = thin_border()
-        ws.cell(legend_row + 1 + i, 2, text).font = cell_font(size=9)
-
-    ws.freeze_panes = f"B{ROW_DATA}"
-
-
-def write_master_sheet(ws, all_scores_by_platform):
+def write_grading_sheet(ws, scores, platform_label, use_case, profiles_map):
     """
-    Master sheet: Risk = MAX, Relevance = AVERAGE across all platforms per influencer.
+    Write the grading sheet that exactly matches the reference file format.
+    Columns are identical to the Abbott reference grading sheet.
     """
-    ws.row_dimensions[1].height = 30
-    ws.cell(1, 1, "Abbott Influencer Vetting — Master Grading Summary").font = Font(
-        name=FONT_NAME, bold=True, size=13, color=C_HEADER_DARK
-    )
 
-    # Collect all unique influencers
-    all_influencers = set()
-    for platform, scores_list in all_scores_by_platform.items():
-        for s in scores_list:
-            all_influencers.add(s["influencer"])
-    all_influencers = sorted(all_influencers)
-
-    headers = [
-        "Influencer Handle",
-        "Risk MAX Score\n(across all platforms)",
-        "Relevance AVG Score\n(across all platforms)",
-        "Risk Zone",
-        "Relevance Zone",
-        "Recommendation",
-        "Platforms Assessed",
-    ]
-
-    ROW_HEADER = 3
-    ROW_DATA   = 4
-
-    ws.row_dimensions[ROW_HEADER].height = 45
-    for ci, h in enumerate(headers, 1):
-        c = ws.cell(ROW_HEADER, ci, h)
-        c.fill = fill(C_HEADER_DARK)
-        c.font = hdr_font()
-        c.alignment = center_align()
-        c.border = thin_border()
-
-    col_widths = [24, 20, 22, 16, 16, 22, 24]
-    for i, w in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    for row_offset, influencer in enumerate(all_influencers):
-        row = ROW_DATA + row_offset
-        ws.row_dimensions[row].height = 18
-
-        risk_vals = []
-        rel_vals  = []
-        platforms_found = []
-
-        for platform, scores_list in all_scores_by_platform.items():
-            for s in scores_list:
-                if s["influencer"] == influencer:
-                    risk_vals.append(s["RISK Score"])
-                    rel_vals.append(s["Total Relevance Score"])
-                    platforms_found.append(platform)
-
-        if not risk_vals:
-            continue
-
-        max_risk   = max(risk_vals)
-        avg_rel    = round(sum(rel_vals) / len(rel_vals), 2)
-        platforms_str = ", ".join(sorted(set(platforms_found)))
-
-        # Risk zone
-        if max_risk == 0:
-            risk_zone = "Green — Clean"
-            risk_bg   = C_GREEN_BG
-        elif max_risk <= 5:
-            risk_zone = "Amber — Review"
-            risk_bg   = C_YELLOW_BG
-        else:
-            risk_zone = "Red — Reject"
-            risk_bg   = C_RED_BG
-
-        # Relevance zone
-        if avg_rel >= 8:
-            rel_zone = "High (8–10)"
-            rel_bg   = C_GREEN_BG
-        elif avg_rel >= 4:
-            rel_zone = "Moderate (4–7)"
-            rel_bg   = C_YELLOW_BG
-        else:
-            rel_zone = "Low (0–3)"
-            rel_bg   = C_RED_BG
-
-        # Recommendation
-        if max_risk > 5:
-            rec = "❌ Reject"
-            rec_bg = C_RED_BG
-        elif max_risk > 0 and avg_rel >= 7:
-            rec = "🟡 Manual Review"
-            rec_bg = C_YELLOW_BG
-        elif avg_rel >= 8 and max_risk == 0:
-            rec = "✅ Approve"
-            rec_bg = C_GREEN_BG
-        elif avg_rel >= 4:
-            rec = "🟡 Manual Review"
-            rec_bg = C_YELLOW_BG
-        else:
-            rec = "⚠ Low Relevance"
-            rec_bg = C_ORANGE_BG
-
-        def mc(col, value, bg, bold=False):
-            c = ws.cell(row, col, value)
-            c.fill = fill(bg)
-            c.font = cell_font(bold=bold)
-            c.border = thin_border()
-            c.alignment = center_align()
-
-        mc(1, influencer, C_GREY_BG, bold=True)
-        mc(2, max_risk,   risk_bg,   bold=True)
-        mc(3, avg_rel,    rel_bg,    bold=True)
-        mc(4, risk_zone,  risk_bg)
-        mc(5, rel_zone,   rel_bg)
-        mc(6, rec,        rec_bg,    bold=True)
-        mc(7, platforms_str, C_WHITE)
-
-    # Notes
-    note_row = ROW_DATA + len(all_influencers) + 2
-    notes = [
-        "Risk = MAX across all platforms — a single harmful instance anywhere is a brand safety risk.",
-        "Relevance = AVERAGE across all platforms — content identity should be consistent, not a peak moment.",
-        "⚠ Yellow cells in platform sheets = Competition check (manual). Fill before finalising Risk Score.",
-        "Abbott Brand Association & Brand Partnerships auto-detected from AI video data (review flagged brand names).",
-    ]
-    ws.cell(note_row, 1, "METHODOLOGY NOTES").font = Font(name=FONT_NAME, bold=True, size=10)
-    for i, note in enumerate(notes):
-        c = ws.cell(note_row + 1 + i, 1, note)
-        c.font = Font(name=FONT_NAME, size=9, italic=True, color="595959")
-
-    ws.freeze_panes = f"B{ROW_DATA}"
-
-
-def write_compact_grading_sheet(ws, scores_list, platform_label, is_captions=False):
-    """
-    Write the compact grading sheet that exactly matches the reference TH file format.
-    One row per influencer. Manual cells highlighted yellow.
-    """
-    FONT_NAME = "Arial"
-
-    # ── Colour palette (matching reference file) ───────────────────────────
-    HDR_RISK_BG    = "FF0000"   # red  — auto-reject headers
-    HDR_PARAM_BG   = "C00000"   # dark red — risk param headers
-    HDR_RISK_SC    = "1F3864"   # navy — RISK Score header
-    HDR_REL_BG     = "375623"   # dark green — relevance headers
-    MANUAL_BG      = "FFEB9C"   # yellow — manual entry cells
-    AUTO_REJ_RED   = "FFC7CE"   # light red — triggered auto-reject
-    RISK_GREEN     = "C6EFCE"
-    RISK_YELLOW    = "FFEB9C"
-    RISK_RED       = "FFC7CE"
-    REL_GREEN      = "C6EFCE"
-    REL_YELLOW     = "FFEB9C"
-    ROW_ALT        = "F2F2F2"   # alternating row bg
-
-    def f(hex_color):
-        return PatternFill("solid", fgColor=hex_color)
-
-    def b(style="thin", color="BFBFBF"):
-        s = Side(style=style, color=color)
-        return Border(left=s, right=s, top=s, bottom=s)
-
-    def hf(color="FFFFFF", bold=True, size=9):
-        return Font(name=FONT_NAME, bold=bold, color=color, size=size)
-
-    def cf(color="000000", bold=False, size=9):
-        return Font(name=FONT_NAME, bold=bold, color=color, size=size)
-
-    def ac(wrap=True):
-        return Alignment(horizontal="center", vertical="center", wrap_text=wrap)
-
-    def al():
-        return Alignment(horizontal="left", vertical="center", wrap_text=True)
-
-    # ── Sheet title ────────────────────────────────────────────────────────
+    # ── Title ─────────────────────────────────────────────────────────────
     ws.row_dimensions[1].height = 22
-    t = ws.cell(1, 1, f"Abbott Influencer Vetting — {platform_label} Grading Sheet")
-    t.font = Font(name=FONT_NAME, bold=True, size=12, color="1F3864")
+    t = ws.cell(1, 1, f"Abbott Influencer Vetting — {platform_label} Grading Sheet ({use_case})")
+    t.font = Font(name=FN, bold=True, size=12, color=C_NAV)
     t.alignment = al()
 
     # ── Column definitions ─────────────────────────────────────────────────
-    # Captions sheet has a "Pregnant Penalty" column before Topics (different order)
-    if is_captions:
-        headers = [
-            ("Influencer",                                  "1F3864", 22),
-            ("Substance Use",                               HDR_RISK_BG, 14),
-            ("Worked With Competition\n(Manual Check)",     HDR_RISK_BG, 20),
-            ("Anti-breastfeeding",                          HDR_RISK_BG, 16),
-            ("Anti-vaccination",                            HDR_RISK_BG, 15),
-            ("Anti-healthcare",                             HDR_RISK_BG, 15),
-            ("Auto-reject?",                                HDR_RISK_BG, 14),
-            ("Profanity Usage",                             HDR_PARAM_BG, 13),
-            ("Alcohol Usage",                               HDR_PARAM_BG, 13),
-            ("Sensitive Content",                           HDR_PARAM_BG, 14),
-            ("Stereotype & Bias",                           HDR_PARAM_BG, 14),
-            ("Violence Advocacy",                           HDR_PARAM_BG, 14),
-            ("Political Stance",                            HDR_PARAM_BG, 13),
-            ("Unscientific Claims",                         HDR_PARAM_BG, 14),
-            ("Ultra-processed Food",                        HDR_PARAM_BG, 14),
-            ("Total Risk Score",                            HDR_RISK_SC, 13),
-            ("Pregnant Penalty",                            HDR_RISK_SC, 13),
-            ("Topics Adult Health\n(5 pts)",                HDR_REL_BG, 15),
-            ("Topics Adult Nutrition\n(2 pts)",             HDR_REL_BG, 16),
-            ("Abbott Brand Association\n(Manual — 1 pt)",   HDR_REL_BG, 18),
-            ("Awards/Media Presence\n(Manual — 1 pt)",      HDR_REL_BG, 18),
-            ("Relevant Brand Partnerships\n(Manual — 1 pt)",HDR_REL_BG, 20),
-            ("Total Relevance Score",                       HDR_REL_BG, 15),
-            ("Brand Collaboration\n(Competitor)",           "595959", 20),
-            ("Relevant Brand Names",                        "595959", 22),
-            ("Award Name",                                  "595959", 20),
+    # Format: (header_text, bg_color, width)
+    if use_case == "Pediatric":
+        relevance_cols = [
+            ("Kids Presence\n(3.5 pts — AI auto)",             C_DKGRN, 16),
+            ("Topics around kids\n(3.5 pts — Manual)",         C_DKGRN, 18),
+            ("Abbott brands\n(1 pt — Manual)",                 C_DKGRN, 16),
+            ("Awards/Media Presence\n(1 pt — Manual)",         C_DKGRN, 18),
+            ("Relevant Brand Partnerships\n(1 pt — Manual)",   C_DKGRN, 20),
         ]
+        notes_col_label = "Kids Age Group (from AI)"
     else:
-        headers = [
-            ("Influencer",                                  "1F3864", 22),
-            ("Substance Use",                               HDR_RISK_BG, 14),
-            ("Worked With Competition\n(Manual Check)",     HDR_RISK_BG, 20),
-            ("Anti-breastfeeding",                          HDR_RISK_BG, 16),
-            ("Anti-vaccination",                            HDR_RISK_BG, 15),
-            ("Anti-healthcare",                             HDR_RISK_BG, 15),
-            ("Auto-reject?\n(Risk=10 if any flag)",         HDR_RISK_BG, 16),
-            ("Profanity",                                   HDR_PARAM_BG, 12),
-            ("Alcohol",                                     HDR_PARAM_BG, 12),
-            ("Sensitive Content",                           HDR_PARAM_BG, 14),
-            ("Stereotype & Bias",                           HDR_PARAM_BG, 14),
-            ("Violence Content",                            HDR_PARAM_BG, 13),
-            ("Political",                                   HDR_PARAM_BG, 12),
-            ("Unscientific",                                HDR_PARAM_BG, 13),
-            ("Ultra-processed Food",                        HDR_PARAM_BG, 14),
-            ("RISK Score",                                  HDR_RISK_SC, 13),
-            ("Topics Around Adult Health\n(5 pts)",         HDR_REL_BG, 17),
-            ("Topics on Adult Healthy Nutrition\n(2 pts)",  HDR_REL_BG, 19),
-            ("Abbott Brand Association\n(Manual — 1 pt)",   HDR_REL_BG, 18),
-            ("Awards/Media Presence\n(Manual — 1 pt)",      HDR_REL_BG, 18),
-            ("Relevant Brand Partnerships\n(Manual — 1 pt)",HDR_REL_BG, 20),
-            ("Total Relevance Score",                       HDR_REL_BG, 15),
-            ("Pregnant Or Not",                             HDR_REL_BG, 13),
-            ("Brand Collaboration\n(Competitor)",           "595959", 20),
-            ("Relevant Brand Names",                        "595959", 22),
-            ("Award Name",                                  "595959", 20),
+        relevance_cols = [
+            ("Topics Adult Health\n(5 pts — AI auto)",         C_DKGRN, 18),
+            ("Topics Adult Nutrition\n(2 pts — AI auto)",      C_DKGRN, 18),
+            ("Abbott brands\n(1 pt — Manual)",                 C_DKGRN, 16),
+            ("Awards/Media Presence\n(1 pt — Manual)",         C_DKGRN, 18),
+            ("Relevant Brand Partnerships\n(1 pt — Manual)",   C_DKGRN, 20),
         ]
+        notes_col_label = "Notes"
 
-    # Set column widths
-    for ci, (_, _, w) in enumerate(headers, 1):
+    COLS = [
+        # (header, bg_color, width)
+        ("Influencer Name",                                     C_NAV,    20),
+        ("Handle / Username",                                   C_NAV,    18),
+        ("Substance Use\n(Auto-reject gate)",                   C_RED_H,  14),
+        ("Worked With Competition\n(Manual Check — last 90d)",  C_RED_H,  20),
+        ("Anti-breastfeeding\n(Auto-reject gate)",              C_RED_H,  16),
+        ("Anti-vaccination\n(Auto-reject gate)",                C_RED_H,  15),
+        ("Anti-healthcare\n(Auto-reject gate)",                 C_RED_H,  15),
+        ("Auto-reject Check\n(>0 = Risk must be 10)",           C_DKRED,  16),
+        ("Profanity",                                           C_BLUE,   12),
+        ("Alcohol",                                             C_BLUE,   12),
+        ("Sensitive Content",                                   C_BLUE,   14),
+        ("Stereotype & Bias",                                   C_BLUE,   14),
+        ("Violence Content",                                    C_BLUE,   13),
+        ("Political",                                           C_BLUE,   12),
+        ("Unscientific",                                        C_BLUE,   13),
+        ("Ultra-processed Food",                                C_BLUE,   14),
+        ("RISK Score\n(0=Clean → 10=Reject)",                   C_NAV,    14),
+    ] + relevance_cols + [
+        ("Total Relevance Score\n(max 10)",                     C_DKGRN,  15),
+        ("Pregnant Or Not",                                     C_DKGRN,  13),
+        ("Notes / Flags",                                       "595959", 24),
+        (notes_col_label,                                       "595959", 28),
+    ]
+
+    # Set widths
+    for ci, (_, _, w) in enumerate(COLS, 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
 
     # ── Header row ─────────────────────────────────────────────────────────
-    ROW_HDR  = 2
-    ROW_DATA = 3
-    ws.row_dimensions[ROW_HDR].height = 48
+    ROW_H = 2
+    ROW_D = 3
+    ws.row_dimensions[ROW_H].height = 52
 
-    for ci, (label, bg, _) in enumerate(headers, 1):
-        c = ws.cell(ROW_HDR, ci, label)
-        c.fill    = f(bg)
-        c.font    = hf()
-        c.border  = b()
+    for ci, (label, bg, _) in enumerate(COLS, 1):
+        c = ws.cell(ROW_H, ci, label)
+        c.fill      = fp(bg)
+        c.font      = hfont()
+        c.border    = bdr()
         c.alignment = ac()
 
-    # ── Data rows ──────────────────────────────────────────────────────────
-    risk_param_keys = [
-        "Profanity Usage", "Alcohol", "Sensitive Content",
-        "Stereotype & Bias", "Violence Content", "Political",
-        "Unscientific", "Ultra-processed Food",
+    # Column index reference (1-based)
+    CI_NAME    = 1
+    CI_HANDLE  = 2
+    CI_SUBST   = 3
+    CI_COMP    = 4    # MANUAL
+    CI_BF      = 5
+    CI_VAX     = 6
+    CI_HC      = 7
+    CI_ARCHECK = 8
+    CI_PROF    = 9
+    CI_ALCO    = 10
+    CI_SENS    = 11
+    CI_STEREO  = 12
+    CI_VIOL    = 13
+    CI_POL     = 14
+    CI_UNSCI   = 15
+    CI_ULTRA   = 16
+    CI_RISK    = 17
+    CI_REL1    = 18   # Kids Presence or Topics Adult Health
+    CI_REL2    = 19   # Topics around kids (manual) or Topics Adult Nutrition
+    CI_REL3    = 20   # Abbott brands (MANUAL)
+    CI_REL4    = 21   # Awards (MANUAL)
+    CI_REL5    = 22   # Brand Partnerships (MANUAL)
+    CI_TOTAL   = 23   # Total Relevance (SUM formula)
+    CI_PREG    = 24
+    CI_NOTE1   = 25
+    CI_NOTE2   = 26
+
+    RISK_PARAM_COLS = [CI_PROF, CI_ALCO, CI_SENS, CI_STEREO,
+                       CI_VIOL, CI_POL, CI_UNSCI, CI_ULTRA]
+    RISK_PARAM_LABELS = [
+        "Profanity", "Alcohol", "Sensitive content", "Stereotype & Bias",
+        "Violence Content", "Political", "Unscientific", "Ultra-processed Food",
     ]
 
-    for row_offset, score in enumerate(scores_list):
-        row     = ROW_DATA + row_offset
+    # ── Data rows ──────────────────────────────────────────────────────────
+    for row_offset, s in enumerate(scores):
+        row = ROW_D + row_offset
         ws.row_dimensions[row].height = 16
-        row_bg  = "FFFFFF" if row_offset % 2 == 0 else ROW_ALT
-        auto_rej = score.get("auto_reject_triggered", 0)
-        risk_val = score.get("RISK Score", 0)
-        preg     = score.get("Pregnant Or Not", 0)
+        row_bg = "FFFFFF" if row_offset % 2 == 0 else C_GREY
+        rel = s["relevance"]
 
         def wc(col, value, bg=None, bold=False, left=False):
             c = ws.cell(row, col, value)
-            c.fill      = f(bg or row_bg)
-            c.font      = cf(bold=bold)
-            c.border    = b()
+            c.fill      = fp(bg or row_bg)
+            c.font      = dfont(bold=bold)
+            c.border    = bdr()
             c.alignment = al() if left else ac()
             return c
 
-        # Col 1 — Influencer name
-        wc(1, score["influencer"], bg="E8F0FE", bold=True, left=True)
+        def manual_cell(col):
+            """Yellow cell for manual entry."""
+            c = ws.cell(row, col, "")
+            c.fill      = fp(C_MANUAL)
+            c.font      = dfont(color="7B4F00")
+            c.border    = bdr()
+            c.alignment = ac()
+            return c
 
-        # Cols 2–6 — Auto-reject gates (AI detected)
-        for col_idx, key in enumerate(
-            ["Substance Use", "Anti-breastfeeding", "Anti-vaccination", "Anti-healthcare"], 2
-        ):
-            val = score.get(key, 0)
-            wc(col_idx, val, bg=AUTO_REJ_RED if val else RISK_GREEN)
+        # Col 1: Full name (from profiles map, or same as handle)
+        full_name = profiles_map.get(s["handle"], s["handle"])
+        wc(CI_NAME, full_name, bg=C_NAME, bold=True, left=True)
 
-        # Col 3 — Competition (MANUAL)
-        c3 = ws.cell(row, 3, "")
-        c3.fill      = f(MANUAL_BG)
-        c3.font      = cf(color="7B4F00")
-        c3.border    = b()
-        c3.alignment = ac()
+        # Col 2: Handle
+        wc(CI_HANDLE, s["handle"], bg=C_NAME, left=True)
 
-        # Col 7 — Auto-reject summary
-        if auto_rej:
-            c7 = wc(7, "AUTO-REJECT", bg="FF0000", bold=True)
-            c7.font = Font(name=FONT_NAME, bold=True, color="FFFFFF", size=9)
+        # Cols 3, 5, 6, 7: Auto-reject gates (AI-detected, show flag 0/1)
+        flags = s["auto_reject_flags"]
+        for col_idx, label in [
+            (CI_SUBST, "Substance Use"),
+            (CI_BF,    "Anti-breastfeeding"),
+            (CI_VAX,   "Anti-vaccination"),
+            (CI_HC,    "Anti-healthcare"),
+        ]:
+            val = flags.get(label, 0)
+            bg  = C_RED if val else C_GREEN
+            wc(col_idx, val, bg=bg)
+
+        # Col 4: Competition — MANUAL
+        manual_cell(CI_COMP)
+
+        # Col 8: Auto-reject check (SUM of flags)
+        ar_sum = s["auto_reject_sum"]
+        if ar_sum > 0:
+            c8 = wc(CI_ARCHECK, ar_sum, bg=C_RED, bold=True)
+            c8.font = Font(name=FN, bold=True, color="FFFFFF", size=9)
         else:
-            wc(7, 0, bg=RISK_GREEN)
+            wc(CI_ARCHECK, 0, bg=C_GREEN)
 
-        # Cols 8–15 — 8 risk parameter scores
-        for ci, key in enumerate(risk_param_keys, 8):
-            val = score.get(key, 0)
-            if val == 1.0:
-                bg = RISK_RED
-            elif val == 0.5:
-                bg = RISK_YELLOW
-            else:
-                bg = RISK_GREEN
-            wc(ci, val, bg=bg)
+        # Cols 9-16: 8 risk parameters
+        rp = s["risk_params"]
+        for col_idx, label in zip(RISK_PARAM_COLS, RISK_PARAM_LABELS):
+            val = rp.get(label, 0)
+            bg  = C_RED if val == 1.0 else (C_AMBER if val == 0.5 else C_GREEN)
+            wc(col_idx, val, bg=bg)
 
-        # Col 16 — RISK Score
-        if risk_val >= 5:
-            rs_bg = RISK_RED
-        elif risk_val > 0:
-            rs_bg = RISK_YELLOW
+        # Col 17: Risk Score
+        rs = s["risk_score"]
+        if rs >= 5:
+            c17 = ws.cell(row, CI_RISK, rs)
+            c17.fill   = fp(C_RED_H)
+            c17.font   = Font(name=FN, bold=True, color="FFFFFF", size=9)
+            c17.border = bdr()
+            c17.alignment = ac()
+        elif rs > 0:
+            wc(CI_RISK, rs, bg=C_AMBER, bold=True)
         else:
-            rs_bg = RISK_GREEN
-        c16 = wc(16, risk_val, bg=rs_bg, bold=True)
+            wc(CI_RISK, rs, bg=C_GREEN, bold=True)
 
-        if is_captions:
-            # Col 17 — Pregnant Penalty (captions layout)
-            preg_penalty = -2 if preg else 0
-            wc(17, preg_penalty, bg=AUTO_REJ_RED if preg else row_bg)
-            rel_offset = 1   # shift relevance cols right by 1
+        # Col 18: Relevance param 1
+        rel1_val = rel.get(list(rel.keys())[0])   # Kids Presence or Topics Health
+        if rel1_val is None:
+            manual_cell(CI_REL1)
         else:
-            rel_offset = 0
+            bg = C_GREEN if rel1_val > 0 else row_bg
+            wc(CI_REL1, rel1_val, bg=bg)
 
-        # Relevance cols: Topics Health, Topics Nutrition (auto)
-        th_val  = score.get("Topics Adult Health", 0) or 0
-        tn_val  = score.get("Topics Adult Nutrition", 0) or 0
-        wc(17 + rel_offset, th_val, bg=REL_GREEN if th_val else row_bg)
-        wc(18 + rel_offset, tn_val, bg=REL_GREEN if tn_val else row_bg)
-
-        # Cols 19-21 — Manual relevance fields (yellow)
-        for manual_col in [19 + rel_offset, 20 + rel_offset, 21 + rel_offset]:
-            cm = ws.cell(row, manual_col, "")
-            cm.fill      = f(MANUAL_BG)
-            cm.font      = cf(color="7B4F00")
-            cm.border    = b()
-            cm.alignment = ac()
-
-        # Col 22 — Total Relevance (live SUM formula)
-        th_col  = get_column_letter(17 + rel_offset)
-        tn_col  = get_column_letter(18 + rel_offset)
-        ab_col  = get_column_letter(19 + rel_offset)
-        aw_col  = get_column_letter(20 + rel_offset)
-        bp_col  = get_column_letter(21 + rel_offset)
-        if is_captions:
-            preg_col_letter = get_column_letter(17)  # pregnant penalty col
-            formula = (f"=MIN(10,MAX(0,"
-                       f"IFERROR({th_col}{row},0)+"
-                       f"IFERROR({tn_col}{row},0)+"
-                       f"IFERROR({ab_col}{row},0)+"
-                       f"IFERROR({aw_col}{row},0)+"
-                       f"IFERROR({bp_col}{row},0)+"
-                       f"IFERROR({preg_col_letter}{row},0)))")
+        # Col 19: Relevance param 2 — always MANUAL for Pediatric (Topics around kids)
+        # For Adult: Topics Adult Nutrition is AI-auto
+        rel2_key = list(rel.keys())[1]
+        rel2_val = rel.get(rel2_key)
+        if rel2_val is None:
+            manual_cell(CI_REL2)
         else:
-            formula = (f"=MIN(10,MAX(0,"
-                       f"IFERROR({th_col}{row},0)+"
-                       f"IFERROR({tn_col}{row},0)+"
-                       f"IFERROR({ab_col}{row},0)+"
-                       f"IFERROR({aw_col}{row},0)+"
-                       f"IFERROR({bp_col}{row},0)-"
-                       f"IF({get_column_letter(23)}{row}=1,2,0)))")
+            bg = C_GREEN if rel2_val > 0 else row_bg
+            wc(CI_REL2, rel2_val, bg=bg)
 
-        auto_base = th_val + tn_val - (2 if preg else 0)
-        rel_bg = REL_GREEN if auto_base >= 7 else (REL_YELLOW if auto_base >= 4 else RISK_RED)
-        c22 = ws.cell(row, 22 + rel_offset, formula)
-        c22.fill      = f(rel_bg)
-        c22.font      = cf(bold=True)
-        c22.border    = b()
-        c22.alignment = ac()
+        # Cols 20, 21, 22: Abbott / Awards / Partnerships — always MANUAL
+        manual_cell(CI_REL3)
+        manual_cell(CI_REL4)
+        manual_cell(CI_REL5)
 
-        if not is_captions:
-            # Col 23 — Pregnant Or Not
-            wc(23, preg, bg=AUTO_REJ_RED if preg else row_bg)
+        # Col 23: Total Relevance — live SUM formula
+        # Adjusts for pregnancy: if Pregnant=1, subtract 2
+        r2_formula_part = (
+            f"IFERROR({get_column_letter(CI_REL2)}{row},0)+"
+        )
+        # For pediatric, also subtract 2 if pregnant (but Pediatric = reject, not penalty)
+        if use_case == "Pediatric":
+            formula = (
+                f"=MIN(10,MAX(0,"
+                f"IFERROR({get_column_letter(CI_REL1)}{row},0)+"
+                f"IFERROR({get_column_letter(CI_REL2)}{row},0)+"
+                f"IFERROR({get_column_letter(CI_REL3)}{row},0)+"
+                f"IFERROR({get_column_letter(CI_REL4)}{row},0)+"
+                f"IFERROR({get_column_letter(CI_REL5)}{row},0)))"
+            )
+        else:
+            formula = (
+                f"=MIN(10,MAX(0,"
+                f"IFERROR({get_column_letter(CI_REL1)}{row},0)+"
+                f"IFERROR({get_column_letter(CI_REL2)}{row},0)+"
+                f"IFERROR({get_column_letter(CI_REL3)}{row},0)+"
+                f"IFERROR({get_column_letter(CI_REL4)}{row},0)+"
+                f"IFERROR({get_column_letter(CI_REL5)}{row},0)-"
+                f"IF({get_column_letter(CI_PREG)}{row}=1,2,0)))"
+            )
 
-        # Cols 24–26 — Notes (blank, for manual fill)
-        for nc in range(24, 27):
-            cn = ws.cell(row, nc, "")
-            cn.fill   = f(row_bg)
-            cn.border = b()
-            cn.font   = cf(size=8, color="595959")
-            cn.alignment = al()
+        auto_base = rel.get("_auto_base", 0) or 0
+        rel_bg = C_GREEN if auto_base >= 7 else (C_AMBER if auto_base >= 4 else row_bg)
+        c23 = ws.cell(row, CI_TOTAL, formula)
+        c23.fill      = fp(rel_bg)
+        c23.font      = dfont(bold=True)
+        c23.border    = bdr()
+        c23.alignment = ac()
+
+        # Col 24: Pregnant
+        preg = rel.get("Pregnant Or Not", 0)
+        if preg:
+            c24 = wc(CI_PREG, "Pregnant — Reject", bg=C_RED, bold=True)
+            c24.font = Font(name=FN, bold=True, color="C00000", size=9)
+        else:
+            wc(CI_PREG, 0, bg=row_bg)
+
+        # Col 25: Notes (blank, manual)
+        wc(CI_NOTE1, "", bg=row_bg, left=True)
+
+        # Col 26: Kids age summary or notes
+        age_summary = rel.get("_kids_age_summary", "")
+        wc(CI_NOTE2, age_summary, bg=row_bg, left=True)
 
     # ── Legend ─────────────────────────────────────────────────────────────
-    leg_row = ROW_DATA + len(scores_list) + 2
-    ws.cell(leg_row, 1, "KEY").font = Font(name=FONT_NAME, bold=True, size=9)
-    legend_items = [
-        (MANUAL_BG,   "🟡 Yellow = Manual check required"),
-        (RISK_GREEN,  "🟢 Green  = Pass / Clean"),
-        (RISK_YELLOW, "🟠 Amber  = Review"),
-        (RISK_RED,    "🔴 Red    = Fail / Reject"),
+    leg = ROW_D + len(scores) + 2
+    ws.cell(leg, 1, "KEY").font = Font(name=FN, bold=True, size=9)
+    for i, (clr, txt) in enumerate([
+        (C_MANUAL, "🟡 Yellow = Manual entry required — fill before submitting"),
+        (C_GREEN,  "🟢 Green  = Clean / Pass"),
+        (C_AMBER,  "🟠 Amber  = Review required"),
+        (C_RED,    "🔴 Red    = Flagged / Reject"),
+        (C_RED_H,  "🔴 Bright Red = Auto-reject triggered or Risk ≥5"),
+    ]):
+        ws.cell(leg+1+i, 1, "").fill   = fp(clr)
+        ws.cell(leg+1+i, 1, "").border = bdr()
+        ws.cell(leg+1+i, 2, txt).font  = Font(name=FN, size=9)
+
+    ws.freeze_panes = f"C{ROW_D}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MASTER SHEET WRITER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_master_sheet(ws, all_scores, use_case, profiles_map):
+    ws.row_dimensions[1].height = 22
+    ws.cell(1, 1, f"Abbott Influencer Vetting — Master Summary ({use_case})").font = \
+        Font(name=FN, bold=True, size=12, color=C_NAV)
+
+    headers = [
+        ("Influencer Name",          C_NAV, 22),
+        ("Handle",                   C_NAV, 18),
+        ("Risk MAX\n(all platforms)", C_DKRED, 16),
+        ("Relevance AVG\n(all platforms)", C_DKGRN, 18),
+        ("Risk Zone",                C_NAV, 16),
+        ("Relevance Zone",           C_NAV, 16),
+        ("Recommendation",           C_NAV, 20),
+        ("Platforms Scored",         C_NAV, 22),
     ]
-    for i, (clr, txt) in enumerate(legend_items):
-        ws.cell(leg_row + 1 + i, 1, "").fill   = f(clr)
-        ws.cell(leg_row + 1 + i, 1, "").border = b()
-        ws.cell(leg_row + 1 + i, 2, txt).font  = Font(name=FONT_NAME, size=9)
+    for i, (_, _, w) in enumerate(headers, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
 
-    ws.freeze_panes = f"B{ROW_DATA}"
+    ROW_H = 3
+    ROW_D = 4
+    ws.row_dimensions[ROW_H].height = 40
+    for ci, (lbl, bg, _) in enumerate(headers, 1):
+        c = ws.cell(ROW_H, ci, lbl)
+        c.fill = fp(bg); c.font = hfont(); c.border = bdr(); c.alignment = ac()
+
+    # Consolidate across platforms
+    by_handle = {}
+    for platform, scores_list in all_scores.items():
+        for s in scores_list:
+            h = s["handle"]
+            if h not in by_handle:
+                by_handle[h] = {"risks": [], "rels": [], "platforms": []}
+            by_handle[h]["risks"].append(s["risk_score"])
+            by_handle[h]["rels"].append(s["relevance"].get("_auto_base", 0) or 0)
+            by_handle[h]["platforms"].append(platform)
+
+    for row_offset, (handle, data) in enumerate(sorted(by_handle.items())):
+        row = ROW_D + row_offset
+        ws.row_dimensions[row].height = 16
+        row_bg = "FFFFFF" if row_offset % 2 == 0 else C_GREY
+
+        max_risk = max(data["risks"])
+        avg_rel  = round(sum(data["rels"]) / len(data["rels"]), 2)
+        plats    = ", ".join(sorted(set(data["platforms"])))
+
+        risk_zone = "🔴 Red — Reject" if max_risk >= 5 else ("🟠 Amber — Review" if max_risk > 0 else "🟢 Green — Clean")
+        risk_bg   = C_RED if max_risk >= 5 else (C_AMBER if max_risk > 0 else C_GREEN)
+        rel_zone  = "🟢 High (8–10)" if avg_rel >= 8 else ("🟠 Moderate (4–7)" if avg_rel >= 4 else "🔴 Low (0–3)")
+        rel_bg    = C_GREEN if avg_rel >= 8 else (C_AMBER if avg_rel >= 4 else C_RED)
+
+        if max_risk >= 5:
+            rec, rec_bg = "❌ Reject", C_RED
+        elif max_risk > 0:
+            rec, rec_bg = "🟡 Manual Review", C_AMBER
+        elif avg_rel >= 8:
+            rec, rec_bg = "✅ Approve", C_GREEN
+        elif avg_rel >= 4:
+            rec, rec_bg = "🟡 Manual Review", C_AMBER
+        else:
+            rec, rec_bg = "⚠ Low Relevance", C_AMBER
+
+        full_name = profiles_map.get(handle, handle)
+
+        def mc(col, val, bg, bold=False, left=False):
+            c = ws.cell(row, col, val)
+            c.fill = fp(bg); c.font = dfont(bold=bold)
+            c.border = bdr()
+            c.alignment = al() if left else ac()
+
+        mc(1, full_name, C_NAME, bold=True, left=True)
+        mc(2, handle, C_NAME, left=True)
+        mc(3, max_risk, risk_bg, bold=True)
+        mc(4, avg_rel, rel_bg, bold=True)
+        mc(5, risk_zone, risk_bg)
+        mc(6, rel_zone, rel_bg)
+        mc(7, rec, rec_bg, bold=True)
+        mc(8, plats, row_bg)
+
+    note_row = ROW_D + len(by_handle) + 2
+    ws.cell(note_row, 1, "NOTES").font = Font(name=FN, bold=True, size=9)
+    for i, note in enumerate([
+        "Risk = MAX across all platforms (worst-case brand safety signal wins).",
+        "Relevance = AVERAGE across platforms (consistent content identity matters).",
+        "🟡 Yellow cells in grading sheets = manual input required before submitting to client.",
+        "NOTE: Relevance shown here is auto-detectable base only. Add manual scores for final total.",
+    ]):
+        ws.cell(note_row+1+i, 1, note).font = Font(name=FN, size=8, italic=True, color="595959")
+
+    ws.freeze_panes = f"C{ROW_D}"
 
 
-def build_output_excel(all_scores_by_platform):
-    """
-    Build the complete output Excel file in memory.
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUT BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Sheet order (matching reference TH file):
-      1. Master Grading Sheet
-      2. TT Grading Sheet        ← compact format (matches reference exactly)
-      3. IG + YT Grading Sheet
-      4. FB Grading Sheet
-      5. Captions Grading Sheet
-      6. TT Scoring Detail       ← detailed scoring breakdown
-      7. FB Scoring Detail
-      8. IG + YT Scoring Detail
-      9. Captions Scoring Detail
-    """
+PLATFORM_LABELS = {
+    "TT":       "TikTok",
+    "FB":       "Facebook",
+    "IG_YT":    "IG + YT",
+    "IG":       "Instagram",
+    "Captions": "Captions",
+}
+
+def build_output_excel(all_scores, use_case, profiles_map):
     wb = openpyxl.Workbook()
 
-    platform_labels = {
-        "TT":       "TikTok",
-        "IG_YT":    "IG + YT",
-        "IG":       "IG + YT",      # merge IG into IG+YT label
-        "FB":       "Facebook",
-        "Captions": "Captions",
-    }
-
-    # Merge IG and IG_YT scores into one list for grading
-    merged = {}
-    for platform, scores_list in all_scores_by_platform.items():
-        label = platform_labels.get(platform, platform)
-        if label not in merged:
-            merged[label] = []
-        merged[label].extend(scores_list)
-
-    # ── 1. Master Grading Sheet ────────────────────────────────────────────
+    # 1. Master sheet
     ws_master = wb.active
     ws_master.title = "Master Grading Sheet"
-    write_master_sheet(ws_master, all_scores_by_platform)
+    write_master_sheet(ws_master, all_scores, use_case, profiles_map)
 
-    # ── 2–5. Compact Grading Sheets (one per platform, matching reference) ─
-    grading_order = ["TikTok", "IG + YT", "Facebook", "Captions"]
-    for label in grading_order:
-        scores = merged.get(label, [])
+    # 2. Per-platform grading sheets
+    for platform in ["TT", "IG_YT", "IG", "FB", "Captions"]:
+        scores = all_scores.get(platform, [])
         if not scores:
             continue
-        is_cap = label == "Captions"
+        label = PLATFORM_LABELS[platform]
         ws = wb.create_sheet(title=f"{label} Grading Sheet")
-        write_compact_grading_sheet(ws, scores, label, is_captions=is_cap)
-
-    # ── 6–9. Detailed Scoring Sheets ──────────────────────────────────────
-    scoring_order = [
-        ("TT",       "TikTok"),
-        ("IG_YT",    "IG + YT"),
-        ("IG",       "Instagram"),
-        ("FB",       "Facebook"),
-        ("Captions", "Captions"),
-    ]
-    for platform, label in scoring_order:
-        scores = all_scores_by_platform.get(platform, [])
-        if not scores:
-            continue
-        ws = wb.create_sheet(title=f"{label} Scoring Detail")
-        write_grading_sheet(ws, scores, label)
+        write_grading_sheet(ws, scores, label, use_case, profiles_map)
 
     buf = BytesIO()
     wb.save(buf)
@@ -1069,236 +790,191 @@ st.set_page_config(
     layout="wide",
 )
 
-# CSS
 st.markdown("""
 <style>
 .stApp { font-family: Arial, sans-serif; }
-.metric-card {
-    background: #f8f9fa; border-radius: 8px; padding: 16px;
-    border-left: 4px solid #2E75B6; margin-bottom: 12px;
-}
 h1 { color: #1F3864; }
 h2 { color: #2E75B6; }
 .green  { color: #375623; font-weight: bold; }
-.yellow { color: #806000; font-weight: bold; }
+.amber  { color: #806000; font-weight: bold; }
 .red    { color: #C00000; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🏥 Abbott Influencer Vetting — Auto-Grader")
-st.caption("Adult Nutrition Use Case (Ensure / Glucerna) | Framework V4 | March 2026")
+st.caption("Framework V4 | Supports Pediatric (Similac/PediaSure) & Adult Nutrition (Ensure/Glucerna)")
 
 st.divider()
 
-col1, col2 = st.columns([2, 1])
+col_up, col_cfg = st.columns([2, 1])
 
-with col1:
+with col_up:
     st.subheader("📂 Upload AI-Processed Excel File")
-    st.caption("Upload the Excel file exported from ConvoTrack / AI analysis pipeline.")
-    uploaded = st.file_uploader(
-        "Drop your file here",
-        type=["xlsx"],
-        help="The file should contain raw AI analysis sheets per influencer per platform (TT, FB, IG, Captions)."
-    )
+    st.caption("The Excel file exported from ConvoTrack / AI analysis pipeline.")
+    uploaded = st.file_uploader("Drop file here", type=["xlsx"])
 
-with col2:
+with col_cfg:
     st.subheader("⚙️ Settings")
-    brand_context = st.selectbox(
-        "Brand / Use Case",
-        ["Adult Nutrition (Ensure / Glucerna)", "Pediatric (Similac / PediaSure)"],
+    use_case_override = st.selectbox(
+        "Use Case (auto-detected, override if needed)",
+        ["Auto-detect", "Pediatric (Similac / PediaSure)", "Adult Nutrition (Ensure / Glucerna)"],
         index=0,
-        help="Affects relevance scoring rules."
     )
-    show_details = st.checkbox("Show per-influencer breakdown preview", value=True)
 
 st.divider()
 
 if uploaded:
-    with st.spinner("Reading file and detecting influencer sheets…"):
+    with st.spinner("Reading file…"):
         xl = pd.read_excel(uploaded, sheet_name=None)
-        sheet_names = list(xl.keys())
-        grouped = detect_influencer_sheets(sheet_names)
+        grouped = detect_influencer_sheets(xl)
+        profiles_map = build_profiles_map(xl)
 
-    # ── Detection summary ──────────────────────────────────────────────────
+    # Use case
+    if use_case_override == "Auto-detect":
+        use_case = detect_use_case(xl)
+        st.info(f"🔍 Auto-detected use case: **{use_case}**")
+    elif "Pediatric" in use_case_override:
+        use_case = "Pediatric"
+    else:
+        use_case = "Adult"
+
     total_sheets = sum(len(v) for v in grouped.values())
-    st.success(f"✅ File loaded — {len(sheet_names)} total sheets detected, {total_sheets} influencer content sheets found.")
+    st.success(f"✅ {len(xl)} sheets found — {total_sheets} influencer content sheets detected")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    for col_widget, (platform, label) in zip(
-        [c1, c2, c3, c4, c5],
-        [("TT","TikTok"), ("FB","Facebook"), ("IG_YT","IG+YT"), ("IG","Instagram"), ("Captions","Captions")]
-    ):
-        col_widget.metric(label, len(grouped[platform]), "sheets")
+    for col_w, (plat, lbl) in zip([c1,c2,c3,c4,c5],
+        [("TT","TikTok"),("FB","Facebook"),("IG_YT","IG+YT"),("IG","Instagram"),("Captions","Captions")]):
+        col_w.metric(lbl, len(grouped[plat]))
 
     st.divider()
 
-    # ── Run scoring ────────────────────────────────────────────────────────
+    # Score
     with st.spinner("Scoring all influencers…"):
         all_scores = {}
-
+        warnings = []
         for platform, sheet_list in grouped.items():
             if not sheet_list:
                 continue
-            platform_scores = []
+            pl_scores = []
             for sheet_name, handle in sheet_list:
                 df = xl[sheet_name]
+                is_cap = platform == "Captions"
                 try:
-                    if platform == "Captions":
-                        score = score_captions_sheet(df, handle)
-                    else:
-                        score = score_standard_sheet(df, handle)
-                    # Try to use actual username from data
-                    actual_handle = extract_username(df)
-                    if actual_handle and actual_handle != "nan":
-                        score["influencer"] = actual_handle
-                    platform_scores.append(score)
+                    s = score_sheet(df, handle, use_case, is_cap)
+                    actual = extract_username(df)
+                    if actual and actual not in ("nan", "HEADER"):
+                        s["handle"] = actual
+                    pl_scores.append(s)
                 except Exception as e:
-                    st.warning(f"Could not score {sheet_name}: {e}")
-            all_scores[platform] = platform_scores
+                    warnings.append(f"{sheet_name}: {e}")
+            all_scores[platform] = pl_scores
 
-    # ── Preview ────────────────────────────────────────────────────────────
-    if show_details:
-        st.subheader("📊 Scoring Preview")
+    if warnings:
+        with st.expander(f"⚠ {len(warnings)} sheets had warnings"):
+            for w in warnings:
+                st.text(w)
 
-        # Consolidate master scores
-        all_influencers_set = set()
-        for pl_scores in all_scores.values():
-            for s in pl_scores:
-                all_influencers_set.add(s["influencer"])
+    # Preview
+    st.subheader("📊 Master Summary Preview")
+    preview_rows = []
+    by_handle = {}
+    for plat, sl in all_scores.items():
+        for s in sl:
+            h = s["handle"]
+            if h not in by_handle:
+                by_handle[h] = {"risks":[], "rels":[], "plats":[]}
+            by_handle[h]["risks"].append(s["risk_score"])
+            by_handle[h]["rels"].append(s["relevance"].get("_auto_base",0) or 0)
+            by_handle[h]["plats"].append(plat)
 
-        master_rows = []
-        for inf in sorted(all_influencers_set):
-            risk_vals, rel_vals, platforms = [], [], []
-            for platform, pl_scores in all_scores.items():
-                for s in pl_scores:
-                    if s["influencer"] == inf:
-                        risk_vals.append(s["RISK Score"])
-                        rel_vals.append(s["Total Relevance Score"])
-                        platforms.append(platform)
-            if risk_vals:
-                max_risk = max(risk_vals)
-                avg_rel  = round(sum(rel_vals) / len(rel_vals), 2)
-                if max_risk > 5:
-                    rec = "❌ Reject"
-                elif max_risk > 0 and avg_rel >= 7:
-                    rec = "🟡 Review"
-                elif avg_rel >= 8 and max_risk == 0:
-                    rec = "✅ Approve"
-                elif avg_rel >= 4:
-                    rec = "🟡 Review"
-                else:
-                    rec = "⚠ Low Rel."
-                master_rows.append({
-                    "Influencer": inf,
-                    "Risk MAX": max_risk,
-                    "Relevance AVG": avg_rel,
-                    "Platforms": ", ".join(sorted(set(platforms))),
-                    "Recommendation": rec
-                })
+    for handle, data in sorted(by_handle.items()):
+        max_r = max(data["risks"])
+        avg_l = round(sum(data["rels"])/len(data["rels"]),2)
+        rec = ("❌ Reject" if max_r>=5 else
+               "✅ Approve" if max_r==0 and avg_l>=8 else "🟡 Review")
+        preview_rows.append({
+            "Name": profiles_map.get(handle, handle),
+            "Handle": handle,
+            "Risk MAX": max_r,
+            "Relevance AVG (auto-base)": avg_l,
+            "Platforms": ", ".join(sorted(set(data["plats"]))),
+            "Recommendation": rec,
+        })
 
-        df_master = pd.DataFrame(master_rows)
+    df_prev = pd.DataFrame(preview_rows)
 
-        def style_row(row):
-            styles = [""] * len(row)
-            idx_risk = df_master.columns.get_loc("Risk MAX")
-            idx_rel  = df_master.columns.get_loc("Relevance AVG")
-            idx_rec  = df_master.columns.get_loc("Recommendation")
+    def style_df(row):
+        styles = [""] * len(row)
+        ri = df_prev.columns.get_loc("Risk MAX")
+        li = df_prev.columns.get_loc("Relevance AVG (auto-base)")
+        reci = df_prev.columns.get_loc("Recommendation")
+        r, l, rec = row["Risk MAX"], row["Relevance AVG (auto-base)"], row["Recommendation"]
+        styles[ri]  = f"background-color: {'#FFC7CE' if r>=5 else '#FFEB9C' if r>0 else '#C6EFCE'}"
+        styles[li]  = f"background-color: {'#C6EFCE' if l>=7 else '#FFEB9C' if l>=4 else '#FFC7CE'}"
+        styles[reci]= f"background-color: {'#C6EFCE' if 'Approve' in rec else '#FFC7CE' if 'Reject' in rec else '#FFEB9C'}; font-weight: bold"
+        return styles
 
-            risk = row["Risk MAX"]
-            rel  = row["Relevance AVG"]
-            rec  = row["Recommendation"]
+    st.dataframe(df_prev.style.apply(style_df, axis=1),
+                 use_container_width=True, height=min(500, 50+len(preview_rows)*36))
 
-            if risk > 5:
-                styles[idx_risk] = "background-color: #FFC7CE; font-weight: bold"
-            elif risk > 0:
-                styles[idx_risk] = "background-color: #FFEB9C"
-            else:
-                styles[idx_risk] = "background-color: #C6EFCE"
-
-            if rel >= 8:
-                styles[idx_rel] = "background-color: #C6EFCE; font-weight: bold"
-            elif rel >= 4:
-                styles[idx_rel] = "background-color: #FFEB9C"
-            else:
-                styles[idx_rel] = "background-color: #FFC7CE"
-
-            if "Approve" in rec:
-                styles[idx_rec] = "background-color: #C6EFCE; font-weight: bold"
-            elif "Reject" in rec:
-                styles[idx_rec] = "background-color: #FFC7CE; font-weight: bold; color: #C00000"
-            else:
-                styles[idx_rec] = "background-color: #FFEB9C"
-            return styles
-
-        st.dataframe(
-            df_master.style.apply(style_row, axis=1),
-            use_container_width=True,
-            height=min(450, 40 + len(master_rows) * 36)
-        )
-
-        # Quick stats
-        approved = len([r for r in master_rows if "Approve" in r["Recommendation"]])
-        review   = len([r for r in master_rows if "Review" in r["Recommendation"]])
-        rejected = len([r for r in master_rows if "Reject" in r["Recommendation"]])
-
-        st.markdown(f"""
-        **Summary:** {len(master_rows)} influencers scored &nbsp;|&nbsp;
-        <span class='green'>✅ Approve: {approved}</span> &nbsp;|&nbsp;
-        <span class='yellow'>🟡 Review: {review}</span> &nbsp;|&nbsp;
-        <span class='red'>❌ Reject: {rejected}</span>
-        """, unsafe_allow_html=True)
+    approve = sum(1 for r in preview_rows if "Approve" in r["Recommendation"])
+    review  = sum(1 for r in preview_rows if "Review"  in r["Recommendation"])
+    reject  = sum(1 for r in preview_rows if "Reject"  in r["Recommendation"])
+    st.markdown(
+        f"**{len(preview_rows)} influencers scored** &nbsp;|&nbsp; "
+        f"<span class='green'>✅ Approve: {approve}</span> &nbsp;|&nbsp; "
+        f"<span class='amber'>🟡 Review: {review}</span> &nbsp;|&nbsp; "
+        f"<span class='red'>❌ Reject: {reject}</span>",
+        unsafe_allow_html=True,
+    )
 
     st.divider()
+    st.subheader("📥 Download Graded Excel")
 
-    # ── Generate and download ──────────────────────────────────────────────
-    st.subheader("📥 Download Grading Sheets")
+    with st.spinner("Building output Excel…"):
+        buf = build_output_excel(all_scores, use_case, profiles_map)
 
-    with st.spinner("Building formatted Excel output…"):
-        output_buffer = build_output_excel(all_scores)
-
-    st.success("✅ Output ready! Click below to download.")
-
-    filename = uploaded.name.replace(".xlsx", "") + "_GRADED.xlsx"
+    fname = uploaded.name.replace(".xlsx","") + f"_GRADED_{use_case}.xlsx"
     st.download_button(
-        label="⬇️ Download Graded Excel",
-        data=output_buffer,
-        file_name=filename,
+        "⬇️ Download Graded Excel",
+        data=buf, file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        type="primary"
+        use_container_width=True, type="primary",
     )
 
     st.caption(
-        "⚠️ **Manual checks still required:** (1) Competition partnerships (last 90 days) — "
-        "highlighted yellow in each grading sheet. "
-        "(2) Review AI-detected brand names for relevance accuracy before submitting to client."
+        "⚠️ **Yellow cells require manual input before submitting to client:** "
+        "Competition check (last 90 days), Abbott brand association, "
+        "Awards/Media presence, Relevant brand partnerships" +
+        (" and Topics around kids." if use_case == "Pediatric" else ".")
     )
 
 else:
-    st.info("👆 Upload your AI-processed Excel file to begin automated grading.")
-
-    with st.expander("ℹ️ How this works"):
+    st.info("👆 Upload your AI-processed Excel file to begin.")
+    with st.expander("ℹ️ How it works"):
         st.markdown("""
-        **Input:** The Excel file from your ConvoTrack / AI pipeline — one sheet per influencer per platform.
+**Input:** AI-processed Excel from ConvoTrack — one sheet per influencer per platform.
 
-        **Auto-calculated (zero manual work):**
-        - All 8 risk parameter scores (Profanity, Alcohol, Sensitive, Stereotype, Violence, Political, Unscientific, Ultra-processed)
-        - Auto-reject gate checks (Substance Use, Anti-BF, Anti-Vax, Anti-HC)
-        - Risk Score per platform: `(sum of 8 params / 8) × 10`
-        - Topics Adult Health (5 pts) + Topics Adult Nutrition (2 pts)
-        - Awards / Media Presence (detected from AI data)
-        - Brand Partnerships — health/nutrition brand keyword detection
-        - Abbott Brand Association (keyword match on brand names)
-        - Pregnancy flag penalty (−2 pts on relevance)
-        - Master sheet: Risk = MAX, Relevance = AVERAGE across all platforms
+**Auto-detected use case:**
+- **Pediatric** (Similac/PediaSure): Uses Kids Presence (3.5 pts auto)
+- **Adult Nutrition** (Ensure/Glucerna): Uses Topics Adult Health (5 pts auto) + Topics Nutrition (2 pts auto)
 
-        **Still manual (flagged in yellow):**
-        - Competition check (last 90 days) — requires human Google search
+**Auto-calculated (zero manual work):**
+| Parameter | Detail |
+|---|---|
+| All 8 risk scores | Profanity, Alcohol, Sensitive, Stereotype, Violence, Political, Unscientific, Ultra-processed |
+| Auto-reject gate flags | Substance Use, Anti-BF, Anti-Vax, Anti-HC — AI count shown, human confirms |
+| Risk Score | (Sum of 8 params ÷ 8) × 10, or 10 if gate triggered |
+| Kids Presence (Pediatric) | Any kids in videos → 3.5 pts |
+| Topics Adult Health/Nutrition (Adult) | Any videos on those topics → 5 + 2 pts |
+| Pregnancy flag | AI-detected |
 
-        **Output:** Formatted Excel with:
-        - TikTok Grading Sheet
-        - Facebook Grading Sheet
-        - Instagram / YouTube Grading Sheet
-        - Captions Grading Sheet
-        - Master Summary (all influencers, final recommendation)
+**Manual (yellow cells — requires human review):**
+- Competition check (last 90 days)
+- Topics around kids (Pediatric only)
+- Abbott brand association
+- Awards / Media presence
+- Relevant brand partnerships
+
+**Output sheets:** Master Summary + per-platform Grading Sheets (TikTok, Facebook, IG+YT, Captions)
         """)
