@@ -390,7 +390,7 @@ def score_sheet(df, handle, use_case):
 # ─────────────────────────────────────────────────────────────────────────────
 
 PLATFORM_PREFIXES = {
-    "TT ":"TT","FB ":"FB","IG + YT ":"IG_YT","IG ":"IG","Captions ":"Captions"
+    "TT ":"TT","FB ":"FB","YT ":"YT","IG + YT ":"IG_YT","IG ":"IG","Captions ":"Captions"
 }
 SKIP_SHEETS = {
     "master grading sheet","tt grading sheet","ig + yt grading sheet",
@@ -784,7 +784,7 @@ def write_composite_sheet(ws, all_platform_scores, use_case, profiles):
 # OUTPUT BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 
-PLAT_LABELS={"TT":"TikTok","FB":"Facebook","IG_YT":"IG + YT","IG":"Instagram","Captions":"Captions"}
+PLAT_LABELS={"TT":"TikTok","FB":"Facebook","YT":"YouTube","IG_YT":"IG + YT","IG":"Instagram","Captions":"Captions"}
 
 def build_excel(platform_scores_map, use_case, profiles):
     """
@@ -1028,6 +1028,7 @@ def build_excel_with_sheets(platform_scores_map, use_case, profiles,
                 # Map UI label → internal key
                 plat_key_map = {
                     "TikTok": "TT", "Facebook": "FB",
+                    "YouTube": "YT", "YouTube (YT)": "YT",
                     "Instagram": "IG", "IG + YouTube": "IG_YT",
                 }
                 pk = plat_key_map.get(platform_label, platform_label)
@@ -1069,7 +1070,7 @@ st.divider()
 st.subheader("📂 Upload Platform Files")
 st.caption("Add one file per platform. Label each file with its platform. Main AI files + optional Captions file.")
 
-PLATFORM_OPTIONS = ["TikTok (TT)", "Facebook (FB)", "Instagram (IG)", "IG + YouTube",
+PLATFORM_OPTIONS = ["TikTok (TT)", "Facebook (FB)", "YouTube (YT)", "Instagram (IG)", "IG + YouTube",
                     "Captions File (handle-named sheets)", "Other / Mixed"]
 
 # Session state for file slots
@@ -1162,6 +1163,7 @@ else:
                 plat_key_map = {
                     "TikTok (TT)":    "TT",
                     "Facebook (FB)":  "FB",
+                    "YouTube (YT)":   "YT",
                     "Instagram (IG)": "IG",
                     "IG + YouTube":   "IG_YT",
                     "Other / Mixed":  None,
