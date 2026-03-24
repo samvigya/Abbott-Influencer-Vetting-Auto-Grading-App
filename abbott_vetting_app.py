@@ -441,9 +441,11 @@ PLATFORM_PREFIXES = {
 SKIP_SHEETS = {
     "master grading sheet", "tt grading sheet", "ig + yt grading sheet",
     "fb grading sheet", "captions grading sheet", "grading", "profiles",
+    "unknown",
 }
 
 def detect_sheets(xl):
+    """Detect influencer sheets in the main AI file (sheets have platform prefixes)."""
     grouped = {p: [] for p in PLATFORM_PREFIXES.values()}
     for sheet in xl:
         if sheet.lower().strip() in SKIP_SHEETS:
@@ -453,6 +455,21 @@ def detect_sheets(xl):
                 grouped[platform].append((sheet, sheet[len(prefix):].strip()))
                 break
     return grouped
+
+
+def detect_captions_sheets(xl_cap):
+    """
+    Detect influencer sheets in a Captions-only file.
+    These files have one sheet per influencer named directly by handle
+    (no platform prefix). Skip 'Grading' and 'Unknown' sheets.
+    Returns list of (sheet_name, handle) tuples.
+    """
+    sheets = []
+    for sheet in xl_cap:
+        if sheet.lower().strip() in SKIP_SHEETS:
+            continue
+        sheets.append((sheet, sheet.strip()))
+    return sheets
 
 
 def build_profiles(xl):
@@ -763,122 +780,78 @@ def write_master_sheet(ws, all_scores, use_case, profiles):
 
 PLAT_LABELS={"TT":"TikTok","FB":"Facebook","IG_YT":"IG + YT","IG":"Instagram","Captions":"Captions"}
 
-def build_excel(all_scores, use_case, profiles):
-    wb=openpyxl.Workbook()
-    ws_m=wb.active; ws_m.title="Master Grading Sheet"
-    write_master_sheet(ws_m,all_scores,use_case,profiles)
-    for plat in ["TT","IG_YT","IG","FB","Captions"]:
-        sl=all_scores.get(plat,[])
+def build_excel(all_scores, use_case, profiles, captions_scores=None):
+    """
+    all_scores:      dict platform → list of score dicts  (main AI file)
+    captions_scores: list of score dicts (Captions file, optional)
+    """
+    wb = openpyxl.Workbook()
+
+    # Merge captions scores into all_scores for master sheet
+    all_for_master = dict(all_scores)
+    if captions_scores:
+        all_for_master["Captions"] = (all_for_master.get("Captions", []) + captions_scores)
+
+    ws_m = wb.active; ws_m.title = "Master Grading Sheet"
+    write_master_sheet(ws_m, all_for_master, use_case, profiles)
+
+    # Per-platform grading sheets from main file
+    for plat in ["TT", "IG_YT", "IG", "FB", "Captions"]:
+        sl = all_scores.get(plat, [])
         if not sl: continue
-        ws=wb.create_sheet(title=f"{PLAT_LABELS[plat]} Grading Sheet")
-        write_grading_sheet(ws,sl,PLAT_LABELS[plat],use_case,profiles)
-    buf=BytesIO(); wb.save(buf); buf.seek(0); return buf
+        ws = wb.create_sheet(title=f"{PLAT_LABELS[plat]} Grading Sheet")
+        write_grading_sheet(ws, sl, PLAT_LABELS[plat], use_case, profiles)
+
+    # Captions file grading sheet (separate tab)
+    if captions_scores:
+        ws_cap = wb.create_sheet(title="Captions File Grading Sheet")
+        write_grading_sheet(ws_cap, captions_scores, "Captions (Caption File)", use_case, profiles)
+
+    buf = BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Abbott Influencer Vetting",page_icon="🏥",layout="wide")
+st.set_page_config(page_title="Abbott Influencer Vetting", page_icon="🏥", layout="wide")
 st.markdown("""<style>
 .stApp{font-family:Arial,sans-serif;}h1{color:#1F3864;}h2{color:#2E75B6;}
 .g{color:#375623;font-weight:bold;}.a{color:#806000;font-weight:bold;}.r{color:#C00000;font-weight:bold;}
-</style>""",unsafe_allow_html=True)
+</style>""", unsafe_allow_html=True)
 
 st.title("🏥 Abbott Influencer Vetting — Auto-Grader v5.0")
 st.caption("Framework V4 | Auto-detects Pediatric vs Adult | All columns read by name | Cross-checks pre-computed values")
 st.divider()
 
-st.subheader("📂 Upload AI-Processed Excel File")
-uploaded=st.file_uploader("Drop your ConvoTrack AI export here",type=["xlsx"],
-    help="Excel file from the AI pipeline — one sheet per influencer per platform.")
+# ── File uploaders ─────────────────────────────────────────────────────────
+col_a, col_b = st.columns(2)
+
+with col_a:
+    st.subheader("📂 Main AI File")
+    st.caption("TT / FB / IG sheets with platform prefix (e.g. TT woanying_24)")
+    uploaded_main = st.file_uploader(
+        "Drop your ConvoTrack AI export here",
+        type=["xlsx"],
+        key="main_file",
+        help="Sheet names start with platform prefix: TT, FB, IG, Captions etc."
+    )
+
+with col_b:
+    st.subheader("📎 Captions File  _(optional)_")
+    st.caption("One sheet per influencer, named by handle (e.g. woanying24)")
+    uploaded_cap = st.file_uploader(
+        "Drop your Captions file here (e.g. Abbott SG Similac_All Captions)",
+        type=["xlsx"],
+        key="captions_file",
+        help="Sheet names are handle names directly, no platform prefix. Grading and Unknown sheets are skipped."
+    )
+
 st.divider()
 
-if uploaded:
-    with st.spinner("Reading file…"):
-        xl=pd.read_excel(uploaded,sheet_name=None)
-        grp=detect_sheets(xl); prf=build_profiles(xl); uc=detect_use_case(xl)
-
-    st.success(f"✅ File loaded | **{uc}** use case detected | "
-               f"{sum(len(v) for v in grp.values())} influencer sheets found")
-
-    cols=st.columns(5)
-    for cw,(p,lb) in zip(cols,[("TT","TikTok"),("FB","Facebook"),
-                                ("IG_YT","IG+YT"),("IG","Instagram"),("Captions","Captions")]):
-        cw.metric(lb,len(grp[p]))
-
-    st.divider()
-    with st.spinner("Scoring all influencer sheets (reading each column by name)…"):
-        all_sc,warns={},[]
-        for plat,sl in grp.items():
-            if not sl: continue
-            psc=[]
-            for sn,h in sl:
-                df=xl[sn]
-                try:
-                    s=score_sheet(df,h,uc)
-                    actual=extract_handle(df)
-                    if actual: s["handle"]=actual
-                    psc.append(s)
-                except Exception as e:
-                    warns.append(f"{sn}: {e}")
-            all_sc[plat]=psc
-
-    if warns:
-        with st.expander(f"⚠ {len(warns)} sheets had errors"):
-            for w in warns: st.text(w)
-
-    # Preview
-    st.subheader("📊 Master Summary Preview")
-    rows=[]
-    by_h={}
-    for p,sl in all_sc.items():
-        for s in sl:
-            h=s["handle"]
-            if h not in by_h: by_h[h]={"risks":[],"rels":[],"plats":[]}
-            by_h[h]["risks"].append(s["risk_score"])
-            by_h[h]["rels"].append(s["auto_base"])
-            by_h[h]["plats"].append(p)
-
-    for h,d in sorted(by_h.items()):
-        mr=max(d["risks"]); al2=round(sum(d["rels"])/len(d["rels"]),2)
-        rec="❌ Reject" if mr>=5 else ("✅ Approve" if mr==0 and al2>=7 else "🟡 Review")
-        rows.append({"Name":prf.get(h,h),"Handle":h,"Risk MAX":mr,
-                     "Rel AVG (auto)":al2,"Platforms":", ".join(sorted(set(d["plats"]))),"Rec":rec})
-
-    dfp=pd.DataFrame(rows)
-    def sty(row):
-        s=[""]*len(row)
-        ri=dfp.columns.get_loc("Risk MAX"); li=dfp.columns.get_loc("Rel AVG (auto)"); rci=dfp.columns.get_loc("Rec")
-        s[ri]=f"background-color:{'#FFC7CE' if row['Risk MAX']>=5 else '#FFEB9C' if row['Risk MAX']>0 else '#C6EFCE'}"
-        s[li]=f"background-color:{'#C6EFCE' if row['Rel AVG (auto)']>=7 else '#FFEB9C' if row['Rel AVG (auto)']>=4 else '#FFC7CE'}"
-        s[rci]=f"background-color:{'#C6EFCE' if 'Approve' in row['Rec'] else '#FFC7CE' if 'Reject' in row['Rec'] else '#FFEB9C'};font-weight:bold"
-        return s
-    st.dataframe(dfp.style.apply(sty,axis=1),use_container_width=True,height=min(500,50+len(rows)*36))
-
-    appr=sum(1 for r in rows if "Approve" in r["Rec"])
-    rev=sum(1 for r in rows if "Review" in r["Rec"])
-    rej=sum(1 for r in rows if "Reject" in r["Rec"])
-    st.markdown(f"**{len(rows)} influencers** &nbsp;|&nbsp; "
-                f"<span class='g'>✅ Approve: {appr}</span> &nbsp;|&nbsp; "
-                f"<span class='a'>🟡 Review: {rev}</span> &nbsp;|&nbsp; "
-                f"<span class='r'>❌ Reject: {rej}</span>",unsafe_allow_html=True)
-
-    st.divider()
-    st.subheader("📥 Download Graded Excel")
-    with st.spinner("Building formatted Excel…"):
-        buf=build_excel(all_sc,uc,prf)
-
-    fname=uploaded.name.replace(".xlsx","")+f"_GRADED_{uc}.xlsx"
-    st.download_button("⬇️ Download Graded Excel",data=buf,file_name=fname,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,type="primary")
-    st.caption("⬛ Yellow cells = manual input required before submitting to client: "
-               "Competition check, Abbott brands, Awards, Relevant partnerships"
-               +(", Topics around kids." if uc=="Pediatric" else "."))
-
-else:
-    st.info("👆 Upload your AI-processed Excel file. Use case is auto-detected — no manual selection needed.")
+# ── Only proceed if at least the main file is uploaded ────────────────────
+if not uploaded_main:
+    st.info("👆 Upload the Main AI file to begin. The Captions file is optional.")
     with st.expander("ℹ️ Scoring methodology"):
         st.markdown("""
 **Step 1 — Per influencer sheet, read each column BY NAME and count YES:**
@@ -902,3 +875,142 @@ Unscientific <15%→🟢, ≥15%→🔴 | Ultra-processed <15%→🟢, 15-30%→
 
 **⬛ Yellow cells (manual):** Competition (last 90d), Abbott brands, Awards, Brand Partnerships, Topics around kids (Pediatric only)
         """)
+
+else:
+    # ── Read main file ─────────────────────────────────────────────────────
+    with st.spinner("Reading main AI file…"):
+        xl      = pd.read_excel(uploaded_main, sheet_name=None)
+        grp     = detect_sheets(xl)
+        prf     = build_profiles(xl)
+        uc      = detect_use_case(xl)
+
+    total_main = sum(len(v) for v in grp.values())
+    st.success(f"✅ Main file loaded | **{uc}** use case detected | {total_main} influencer sheets")
+
+    cols = st.columns(5)
+    for cw, (p, lb) in zip(cols, [("TT","TikTok"),("FB","Facebook"),
+                                    ("IG_YT","IG+YT"),("IG","Instagram"),("Captions","Captions")]):
+        cw.metric(lb, len(grp[p]))
+
+    # ── Read captions file (if uploaded) ──────────────────────────────────
+    cap_sheets = []
+    if uploaded_cap:
+        with st.spinner("Reading captions file…"):
+            xl_cap     = pd.read_excel(uploaded_cap, sheet_name=None)
+            cap_sheets = detect_captions_sheets(xl_cap)
+            # Use same use_case as main file
+        st.success(f"✅ Captions file loaded | {len(cap_sheets)} influencer caption sheets found")
+
+    st.divider()
+
+    # ── Score main file ────────────────────────────────────────────────────
+    with st.spinner("Scoring all influencer sheets…"):
+        all_sc, warns = {}, []
+        for plat, sl in grp.items():
+            if not sl: continue
+            psc = []
+            for sn, h in sl:
+                df = xl[sn]
+                try:
+                    s = score_sheet(df, h, uc)
+                    actual = extract_handle(df)
+                    if actual: s["handle"] = actual
+                    psc.append(s)
+                except Exception as e:
+                    warns.append(f"{sn}: {e}")
+            all_sc[plat] = psc
+
+    # ── Score captions file ────────────────────────────────────────────────
+    cap_scores = []
+    if cap_sheets:
+        with st.spinner(f"Scoring {len(cap_sheets)} captions sheets…"):
+            for sn, h in cap_sheets:
+                df = xl_cap[sn]
+                try:
+                    s = score_sheet(df, h, uc)
+                    # Use sheet name as handle (captions file has no platform_username col)
+                    s["handle"] = h
+                    s["fmt"] = s["fmt"] + " (Captions file)"
+                    cap_scores.append(s)
+                except Exception as e:
+                    warns.append(f"Captions/{sn}: {e}")
+        st.success(f"✅ {len(cap_scores)} captions sheets scored")
+
+    if warns:
+        with st.expander(f"⚠ {len(warns)} sheets had errors"):
+            for w in warns: st.text(w)
+
+    # ── Preview ────────────────────────────────────────────────────────────
+    st.subheader("📊 Master Summary Preview")
+
+    # Combine all scores for preview
+    all_combined = dict(all_sc)
+    if cap_scores:
+        all_combined["Captions"] = all_combined.get("Captions", []) + cap_scores
+
+    rows = []
+    by_h = {}
+    for p, sl in all_combined.items():
+        for s in sl:
+            h = s["handle"]
+            if h not in by_h: by_h[h] = {"risks": [], "rels": [], "plats": []}
+            by_h[h]["risks"].append(s["risk_score"])
+            by_h[h]["rels"].append(s["auto_base"])
+            by_h[h]["plats"].append(p)
+
+    for h, d in sorted(by_h.items()):
+        mr  = max(d["risks"])
+        al2 = round(sum(d["rels"]) / len(d["rels"]), 2)
+        rec = "❌ Reject" if mr >= 5 else ("✅ Approve" if mr == 0 and al2 >= 7 else "🟡 Review")
+        rows.append({"Name": prf.get(h, h), "Handle": h, "Risk MAX": mr,
+                     "Rel AVG (auto)": al2,
+                     "Platforms": ", ".join(sorted(set(d["plats"]))), "Rec": rec})
+
+    dfp = pd.DataFrame(rows)
+    def sty(row):
+        s = [""] * len(row)
+        ri  = dfp.columns.get_loc("Risk MAX")
+        li  = dfp.columns.get_loc("Rel AVG (auto)")
+        rci = dfp.columns.get_loc("Rec")
+        s[ri]  = f"background-color:{'#FFC7CE' if row['Risk MAX']>=5 else '#FFEB9C' if row['Risk MAX']>0 else '#C6EFCE'}"
+        s[li]  = f"background-color:{'#C6EFCE' if row['Rel AVG (auto)']>=7 else '#FFEB9C' if row['Rel AVG (auto)']>=4 else '#FFC7CE'}"
+        s[rci] = f"background-color:{'#C6EFCE' if 'Approve' in row['Rec'] else '#FFC7CE' if 'Reject' in row['Rec'] else '#FFEB9C'};font-weight:bold"
+        return s
+
+    st.dataframe(dfp.style.apply(sty, axis=1), use_container_width=True,
+                 height=min(500, 50 + len(rows) * 36))
+
+    appr = sum(1 for r in rows if "Approve" in r["Rec"])
+    rev  = sum(1 for r in rows if "Review"  in r["Rec"])
+    rej  = sum(1 for r in rows if "Reject"  in r["Rec"])
+    st.markdown(
+        f"**{len(rows)} influencers** &nbsp;|&nbsp; "
+        f"<span class='g'>✅ Approve: {appr}</span> &nbsp;|&nbsp; "
+        f"<span class='a'>🟡 Review: {rev}</span> &nbsp;|&nbsp; "
+        f"<span class='r'>❌ Reject: {rej}</span>",
+        unsafe_allow_html=True
+    )
+
+    st.divider()
+    st.subheader("📥 Download Graded Excel")
+    with st.spinner("Building formatted Excel…"):
+        buf = build_excel(all_sc, uc, prf, captions_scores=cap_scores if cap_scores else None)
+
+    fname = uploaded_main.name.replace(".xlsx", "") + f"_GRADED_{uc}.xlsx"
+    st.download_button(
+        "⬇️ Download Graded Excel", data=buf, file_name=fname,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True, type="primary"
+    )
+
+    # Output sheet list
+    sheet_list = ["Master Grading Sheet"]
+    for plat in ["TT","IG_YT","IG","FB","Captions"]:
+        if all_sc.get(plat): sheet_list.append(f"{PLAT_LABELS[plat]} Grading Sheet")
+    if cap_scores: sheet_list.append("Captions File Grading Sheet")
+
+    st.caption(
+        f"Output contains: {', '.join(sheet_list)}  |  "
+        "⬛ Yellow cells = manual input: Competition check, Abbott brands, Awards, Relevant partnerships"
+        + (", Topics around kids." if uc == "Pediatric" else ".")
+    )
