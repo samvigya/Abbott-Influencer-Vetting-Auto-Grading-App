@@ -807,6 +807,249 @@ def build_excel(platform_scores_map, use_case, profiles):
 
     buf=BytesIO(); wb.save(buf); buf.seek(0); return buf
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INFLUENCER RAW SHEET WRITER  (with formula rows)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Code/Point formula template per column name.
+# {L} = placeholder for the actual Excel column letter.
+# Kids/Topics/Media: use row 2 (count) directly since binary presence check.
+# Risk params: use row 4 (% prevalence) with threshold formulas.
+FORMULA_CODE_POINT = {
+    "Kids Presenence":                   '=IF({L}2>0,"GREEN","RED")',
+    "Brand Partnership Presence":         "Check Manually for Competition",
+    "Media Presence & Awards":           '=IF({L}2>0,"GREEN","RED")',
+    "Alcohol Use Discussion":            '=IF({L}4>0.15,"RED",IF({L}4>0.05,"AMBER","GREEN"))',
+    "Vaccination":                       '=IF({L}4>0,"RED","GREEN")',
+    "Health care stance":                '=IF({L}4>0,"RED","GREEN")',
+    "Ultra-processed food":              '=IF({L}4>0.3,"RED",IF({L}4>0.15,"AMBER","GREEN"))',
+    "Pregnant":                          '=IF({L}4>0,"RED","GREEN")',
+    "Profanity Usage":                   '=IF({L}4>0.3,"RED",IF({L}4>0.15,"AMBER","GREEN"))',
+    "Substance Use Discussion":          '=IF({L}4>0,"RED","GREEN")',
+    "Sensitive Visual Content":          '=IF({L}4>0.2,"RED","GREEN")',
+    "Stereotypes or Bias":               '=IF({L}4>0.15,"RED",IF({L}4>0.05,"AMBER","GREEN"))',
+    "Violence Advocacy":                 '=IF({L}4>=0.05,"RED",IF({L}4>0,"AMBER","GREEN"))',
+    "Political Stance":                  '=IF({L}4>0.25,"RED",IF({L}4>0.1,"AMBER","GREEN"))',
+    "Breastfeeding":                     '=IF({L}4>0,"RED","GREEN")',
+    "Unscientific Claims":               '=IF({L}4>=0.15,"RED","GREEN")',
+    "Topics around Adult Health":        '=IF({L}2>0,"GREEN","RED")',
+    "Topics on Adult Healthy Nutrition": '=IF({L}2>0,"GREEN","RED")',
+}
+
+# Background colours for the 4 formula rows
+ROW_COLORS = {
+    2: "D9E1F2",   # light blue  — YES count
+    3: "EBF3FB",   # lighter blue — total videos
+    4: "FFF2CC",   # light yellow — % prevalence
+    5: "E2EFDA",   # light green  — Code/Point
+}
+
+
+def write_influencer_sheet(wb, df, sheet_title, fmt):
+    """
+    Write one influencer's raw data sheet into the workbook.
+
+    Structure written (matches the reference Excel exactly):
+      Row 1 : column headers
+      Row 2 : HEADER label  +  COUNTIFS("Yes") formula per flag column
+      Row 3 : Total Videos Processed  +  COUNTA formula per flag column
+      Row 4 : % Prevalence  +  =row2/row3 per flag column
+      Row 5 : Code/Point  +  IF threshold formula per flag column
+      Row 6+: individual video rows (Yes/No data)
+
+    For Format A DataFrames, the summary rows are already in pandas rows 0-3
+    and data starts at pandas row 4. We skip those and rewrite from scratch so
+    formulas are always correct (fixing any typos from the source file).
+
+    For Format B DataFrames (Yes/No individual rows), data starts at pandas
+    row 0 and there are no existing summary rows — we add them here.
+    """
+    safe_title = sheet_title[:31]  # Excel sheet name limit
+    ws = wb.create_sheet(title=safe_title)
+
+    # ── Determine data rows ───────────────────────────────────────────────
+    # Format A has 4 summary rows at the top (pandas rows 0-3), data from row 4.
+    # Format B has data from row 0.
+    data_start_pandas = 4 if fmt in ("A", "C", "IG") else 0
+    data_rows = df.iloc[data_start_pandas:].reset_index(drop=True)
+
+    col_names = list(df.columns)
+    n_cols    = len(col_names)
+
+    # Build col_name → Excel column letter mapping
+    col_letter = {}
+    for i, name in enumerate(col_names):
+        col_letter[name] = get_column_letter(i + 1)
+
+    # Excel data starts at row 6 (rows 1-5 are header + 4 formula rows)
+    data_excel_start = 6
+
+    # ── Row 1: column headers ──────────────────────────────────────────────
+    header_fill = PatternFill("solid", fgColor="1F3864")
+    header_font = Font(name=FN, bold=True, color="FFFFFF", size=9)
+    ws.row_dimensions[1].height = 20
+    for i, name in enumerate(col_names, 1):
+        c = ws.cell(1, i, name)
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = bdr()
+        ws.column_dimensions[get_column_letter(i)].width = max(12, min(30, len(str(name)) + 2))
+
+    # ── Rows 2–5: formula rows ─────────────────────────────────────────────
+    row_labels = {
+        2: ("response_1", "HEADER"),
+        3: ("response_1", "Total Videos Processed"),
+        4: ("response_1", "% Prevalence"),
+        5: ("response_1", "Code/Point"),
+    }
+    label_fill = PatternFill("solid", fgColor="2E75B6")
+    label_font = Font(name=FN, bold=True, color="FFFFFF", size=9)
+
+    for row_num in [2, 3, 4, 5]:
+        ws.row_dimensions[row_num].height = 16
+        row_bg = PatternFill("solid", fgColor=ROW_COLORS[row_num])
+        row_font = Font(name=FN, bold=True, size=9, color="000000")
+
+        # Label in response_1 col (col B typically)
+        label_col, label_text = row_labels[row_num]
+        if label_col in col_letter:
+            lc = ws.cell(row_num, col_names.index(label_col) + 1, label_text)
+            lc.fill = label_fill; lc.font = label_font
+            lc.alignment = Alignment(horizontal="left", vertical="center")
+            lc.border = bdr()
+
+        for col_name, letter in col_letter.items():
+            col_idx = col_names.index(col_name) + 1
+            cell = ws.cell(row_num, col_idx)
+            cell.fill = row_bg
+            cell.font = row_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = bdr()
+
+            if col_name not in FORMULA_CODE_POINT and col_name != "response_1":
+                # No formula for this column — leave empty
+                continue
+
+            if row_num == 2 and col_name in FORMULA_CODE_POINT:
+                # YES count
+                cell.value = f'=COUNTIFS({letter}{data_excel_start}:{letter}10000,"Yes")'
+                cell.number_format = "0"
+
+            elif row_num == 3 and col_name in FORMULA_CODE_POINT:
+                # Total videos — use COUNTA of same column
+                cell.value = f'=COUNTA({letter}{data_excel_start}:{letter}10000)'
+                cell.number_format = "0"
+
+            elif row_num == 4 and col_name in FORMULA_CODE_POINT:
+                # % prevalence
+                cell.value = f'=IFERROR({letter}2/{letter}3,0)'
+                cell.number_format = "0.00%"
+
+            elif row_num == 5 and col_name in FORMULA_CODE_POINT:
+                # Code/Point — apply threshold formula
+                template = FORMULA_CODE_POINT[col_name]
+                if template.startswith("="):
+                    cell.value = template.replace("{L}", letter)
+                else:
+                    cell.value = template  # e.g. "Check Manually for Competition"
+                # Colour the cell based on what it will evaluate to
+                # (we can't know at write-time so use neutral)
+                cell.fill = PatternFill("solid", fgColor="E2EFDA")
+
+    # ── Rows 6+: data rows (use append for speed) ─────────────────────────
+    alt_fills = [
+        PatternFill("solid", fgColor="FFFFFF"),
+        PatternFill("solid", fgColor="F2F2F2"),
+    ]
+    data_font  = Font(name=FN, size=8)
+    data_align = Alignment(horizontal="left", vertical="top", wrap_text=False)
+    data_border= bdr()
+
+    for row_offset, (_, data_row) in enumerate(data_rows.iterrows()):
+        excel_row = data_excel_start + row_offset
+        row_fill  = alt_fills[row_offset % 2]
+        ws.row_dimensions[excel_row].height = 14
+
+        # Build list of values for this row
+        row_vals = []
+        for col_name in col_names:
+            val = data_row[col_name]
+            row_vals.append(None if pd.isna(val) else val)
+
+        # Append the row values (fast)
+        ws.append(row_vals)
+
+        # Apply minimal styling to the row (skip border on bulk rows for speed)
+        for col_idx in range(1, n_cols + 1):
+            cell = ws.cell(excel_row, col_idx)
+            cell.fill = row_fill
+            cell.font = data_font
+
+    # Freeze header + formula rows
+    ws.freeze_panes = f"A{data_excel_start}"
+    return ws
+
+
+def build_excel_with_sheets(platform_scores_map, use_case, profiles,
+                             raw_xl_map=None):
+    """
+    Build the complete output Excel file.
+
+    platform_scores_map : dict  label → (scores_list, manual_dict)
+    raw_xl_map          : dict  label → xl_dict  (raw Excel data per platform)
+                          Optional. If provided, each influencer's raw sheet is
+                          written with formula rows into the output file.
+    """
+    wb = openpyxl.Workbook()
+
+    # ── 1. Composite Grading Sheet ────────────────────────────────────────
+    ws_comp = wb.active
+    ws_comp.title = "Composite Grading Sheet"
+    all_for_composite = {lbl: sc for lbl, (sc, _) in platform_scores_map.items()}
+    write_composite_sheet(ws_comp, all_for_composite, use_case, profiles)
+
+    # ── 2. Per-platform Grading Sheets ────────────────────────────────────
+    for label, (scores, manual) in platform_scores_map.items():
+        if not scores: continue
+        ws = wb.create_sheet(title=f"{label} Grading Sheet"[:31])
+        write_grading_sheet(ws, scores, label, use_case, profiles,
+                            manual_scores=manual)
+
+    # ── 3. Individual influencer sheets with formula rows ─────────────────
+    if raw_xl_map:
+        for platform_label, xl in raw_xl_map.items():
+            # Detect which sheets belong to this platform
+            is_cap = "Caption" in platform_label
+            if is_cap:
+                sheet_list = detect_captions_sheets(xl)
+            else:
+                # Map UI label → internal key
+                plat_key_map = {
+                    "TikTok": "TT", "Facebook": "FB",
+                    "Instagram": "IG", "IG + YouTube": "IG_YT",
+                }
+                pk = plat_key_map.get(platform_label, platform_label)
+                grp = detect_sheets(xl)
+                sheet_list = grp.get(pk, [])
+
+            for sn, handle in sheet_list:
+                df  = xl[sn]
+                fmt = detect_format(df)
+                # Sheet title: use original sheet name, truncated to 31 chars
+                sheet_title = sn[:31]
+                try:
+                    write_influencer_sheet(wb, df, sheet_title, fmt)
+                except Exception as e:
+                    # Never crash the whole build for one bad sheet
+                    pass
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -895,6 +1138,7 @@ else:
 
     # ── Score each file ────────────────────────────────────────────────────
     platform_scores_map = {}   # label → (scores_list, manual_dict)
+    raw_xl_map          = {}   # label → xl dict (for influencer sheets)
     all_warns = []
 
     for plat_label, f in uploaded_files:
@@ -902,6 +1146,9 @@ else:
         xl = pd.read_excel(f, sheet_name=None)
         prf = build_profiles(xl)
         if prf: profiles.update(prf)
+
+        # Store raw xl for influencer sheet writing
+        raw_xl_map[plat_label.split("(")[0].strip()] = xl
 
         # Read manual scores if Grading sheet exists
         manual = read_manual_scores(xl)
@@ -912,19 +1159,17 @@ else:
             if is_cap_file:
                 scores, warns = score_file(xl, plat_label, use_case, is_captions_file=True)
             else:
-                # Map UI label to internal platform key
                 plat_key_map = {
-                    "TikTok (TT)":                  "TT",
-                    "Facebook (FB)":                "FB",
-                    "Instagram (IG)":               "IG",
-                    "IG + YouTube":                 "IG_YT",
-                    "Other / Mixed":                None,
+                    "TikTok (TT)":    "TT",
+                    "Facebook (FB)":  "FB",
+                    "Instagram (IG)": "IG",
+                    "IG + YouTube":   "IG_YT",
+                    "Other / Mixed":  None,
                 }
                 pk = plat_key_map.get(plat_label)
                 if pk:
                     scores, warns = score_file(xl, pk, use_case, is_captions_file=False)
                 else:
-                    # Score all detected platforms from mixed file
                     grp = detect_sheets(xl)
                     scores, warns = [], []
                     for p, sl in grp.items():
@@ -939,7 +1184,6 @@ else:
                                 warns.append(f"{sn}: {e}")
 
         all_warns.extend(warns)
-        # Use display label for output (shorten if needed)
         display = plat_label.split("(")[0].strip()
         platform_scores_map[display] = (scores, manual)
         st.write(f"  ✅ **{display}**: {len(scores)} sheets scored"
@@ -998,22 +1242,26 @@ else:
     # ── Download ───────────────────────────────────────────────────────────
     st.divider()
     st.subheader("📥 Download Graded Excel")
+    st.caption("Contains: Composite Grading + per-platform Grading Sheets + every influencer's raw sheet with formula rows")
 
-    with st.spinner("Building output Excel…"):
-        buf = build_excel(platform_scores_map, use_case, profiles)
+    with st.spinner("Building output Excel (writing formula rows for all influencer sheets)…"):
+        buf = build_excel_with_sheets(platform_scores_map, use_case, profiles,
+                                      raw_xl_map=raw_xl_map)
 
     first_fname = uploaded_files[0][1].name.replace(".xlsx","") if uploaded_files else "Abbott"
     fname = f"{first_fname}_GRADED_{use_case}.xlsx"
 
     st.download_button(
-        "⬇️ Download Composite + Platform Grading Excel",
+        "⬇️ Download Complete Graded Excel",
         data=buf, file_name=fname,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True, type="primary"
     )
 
     sheet_list = ["Composite Grading Sheet"] + [f"{lbl} Grading Sheet" for lbl in platform_scores_map if platform_scores_map[lbl][0]]
+    total_inf_sheets = sum(len(sc) for sc, _ in platform_scores_map.values())
     st.caption(
-        f"**Output sheets:** {' | '.join(sheet_list)}  |  "
-        "⬛ Yellow = manual input required | 🟩 Dark green text = pre-filled from your Grading sheet"
+        f"**Output:** {' | '.join(sheet_list)} | "
+        f"+ {total_inf_sheets} influencer raw sheets (each with 4 formula rows: Count / Total / % / Code-Point)  |  "
+        "⬛ Yellow = manual input | 🟩 Dark green = pre-filled"
     )
