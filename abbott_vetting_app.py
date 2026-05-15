@@ -959,6 +959,12 @@ def write_influencer_sheet(wb, df, sheet_title, fmt):
                 cell.fill = PatternFill("solid", fgColor="E2EFDA")
 
     # ── Rows 6+: data rows (use append for speed) ─────────────────────────
+    # CRITICAL: tell openpyxl that rows 1-5 are already written.
+    # ws.append() only tracks _current_row from previous append() calls —
+    # it ignores rows written with ws.cell(). Without this, append() starts
+    # at row 1 and overwrites all the formula rows.
+    ws._current_row = data_excel_start - 1  # = 5
+
     alt_fills = [
         PatternFill("solid", fgColor="FFFFFF"),
         PatternFill("solid", fgColor="F2F2F2"),
@@ -1018,14 +1024,16 @@ def build_excel_with_sheets(platform_scores_map, use_case, profiles,
                             manual_scores=manual)
 
     # ── 3. Individual influencer sheets with formula rows ─────────────────
+    inf_errors = []
+    inf_written = 0
+    existing_titles = set(ws.title for ws in wb.worksheets)
+
     if raw_xl_map:
         for platform_label, xl in raw_xl_map.items():
-            # Detect which sheets belong to this platform
             is_cap = "Caption" in platform_label
             if is_cap:
                 sheet_list = detect_captions_sheets(xl)
             else:
-                # Map UI label → internal key
                 plat_key_map = {
                     "TikTok": "TT", "Facebook": "FB",
                     "YouTube": "YT", "YouTube (YT)": "YT",
@@ -1035,21 +1043,36 @@ def build_excel_with_sheets(platform_scores_map, use_case, profiles,
                 grp = detect_sheets(xl)
                 sheet_list = grp.get(pk, [])
 
+                # Debug: if no sheets matched, log it
+                if not sheet_list:
+                    inf_errors.append(
+                        f"[{platform_label}] No sheets found for platform key '{pk}'. "
+                        f"Available groups: { {k: len(v) for k, v in grp.items() if v} }"
+                    )
+
             for sn, handle in sheet_list:
                 df  = xl[sn]
                 fmt = detect_format(df)
-                # Sheet title: use original sheet name, truncated to 31 chars
-                sheet_title = sn[:31]
+
+                # Build a unique sheet title (avoids openpyxl ValueError on duplicates)
+                base_title = sn[:28]
+                sheet_title = base_title
+                suffix = 2
+                while sheet_title in existing_titles:
+                    sheet_title = f"{base_title[:25]}_{suffix}"
+                    suffix += 1
+                existing_titles.add(sheet_title)
+
                 try:
                     write_influencer_sheet(wb, df, sheet_title, fmt)
+                    inf_written += 1
                 except Exception as e:
-                    # Never crash the whole build for one bad sheet
-                    pass
+                    inf_errors.append(f"{sn}: {e}")
 
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
-    return buf
+    return buf, inf_errors, inf_written
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
@@ -1255,8 +1278,13 @@ else:
     st.caption("Contains: Composite Grading + per-platform Grading Sheets + every influencer's raw sheet with formula rows")
 
     with st.spinner("Building output Excel (writing formula rows for all influencer sheets)…"):
-        buf = build_excel_with_sheets(platform_scores_map, use_case, profiles,
-                                      raw_xl_map=raw_xl_map)
+        buf, inf_errors, inf_written = build_excel_with_sheets(platform_scores_map, use_case, profiles,
+                                                               raw_xl_map=raw_xl_map)
+
+    st.info(f"📋 Influencer raw sheets written: **{inf_written}** (each with 4 formula rows)")
+    if inf_errors:
+        with st.expander(f"⚠ {len(inf_errors)} influencer sheet issue(s) — click to see"):
+            for e in inf_errors: st.text(e)
 
     first_fname = uploaded_files[0][1].name.replace(".xlsx","") if uploaded_files else "Abbott"
     fname = f"{first_fname}_GRADED_{use_case}.xlsx"
