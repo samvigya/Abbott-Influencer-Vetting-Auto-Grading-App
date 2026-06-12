@@ -344,9 +344,12 @@ def score_sheet(df, handle, use_case):
         kids_pts  = 3.5 if kids_code == "GREEN" else 0.0
         age_sum   = kids_age_summary(df, fmt)
         auto_base = kids_pts
+        _, _, _, kg_code = sc("Kids Growth")
+        kg_pts = 3.5 if kg_code == "GREEN" else 0.0
+        auto_base += kg_pts
         relevance = {
             "Kids Presence":               {"pts": kids_pts, "code": kids_code, "auto": True},
-            "Topics around kids":          {"pts": None, "manual": True, "max_pts": 3.5},
+            "Topics around kids":          {"pts": kg_pts,  "code": kg_code,  "auto": True},
             "Abbott brands":               {"pts": None, "manual": True, "max_pts": 1.0},
             "Awards/Media Presence":       {"pts": None, "manual": True, "max_pts": 1.0},
             "Relevant Brand Partnerships": {"pts": None, "manual": True, "max_pts": 1.0},
@@ -401,9 +404,10 @@ def detect_sheets(xl):
     grouped = {p:[] for p in PLATFORM_PREFIXES.values()}
     for sheet in xl:
         if sheet.lower().strip() in SKIP_SHEETS: continue
+        sheet_stripped = sheet.strip()
         for prefix, plat in PLATFORM_PREFIXES.items():
-            if sheet.startswith(prefix):
-                grouped[plat].append((sheet, sheet[len(prefix):].strip()))
+            if sheet_stripped.startswith(prefix):
+                grouped[plat].append((sheet, sheet_stripped[len(prefix):].strip()))
                 break
     return grouped
 
@@ -519,7 +523,7 @@ def write_grading_sheet(ws, scores, label, use_case, profiles, manual_scores=Non
     if use_case == "Pediatric":
         rel_cols = [
             ("Kids Presence\n(3.5 pts — AI auto)",              "dkgrn", 16, False),
-            ("Topics around kids\n(3.5 pts — ⬛ Manual)",        "manual",18, True),
+            ("Topics around kids\n(3.5 pts — AI auto)",          "dkgrn", 18, False),
             ("Abbott brands\n(1 pt — ⬛ Manual)",                "manual",16, True),
             ("Awards/Media Presence\n(1 pt — ⬛ Manual)",        "manual",18, True),
             ("Relevant Brand Partnerships\n(1 pt — ⬛ Manual)",  "manual",20, True),
@@ -654,7 +658,6 @@ def write_grading_sheet(ws, scores, label, use_case, profiles, manual_scores=Non
         rel_keys = list(s["relevance"].keys())
         # Map manual keys to pre-filled values
         manual_map = {
-            "Topics around kids":          m.get("topics_kids"),
             "Abbott brands":               m.get("abbott"),
             "Awards/Media Presence":       m.get("awards"),
             "Relevant Brand Partnerships": m.get("partnerships"),
@@ -818,6 +821,7 @@ def build_excel(platform_scores_map, use_case, profiles):
 # Risk params: use row 4 (% prevalence) with threshold formulas.
 FORMULA_CODE_POINT = {
     "Kids Presenence":                   '=IF({L}2>0,"GREEN","RED")',
+    "Kids Growth":                        '=IF({L}2>0,"GREEN","RED")',
     "Brand Partnership Presence":         "Check Manually for Competition",
     "Media Presence & Awards":           '=IF({L}2>0,"GREEN","RED")',
     "Alcohol Use Discussion":            '=IF({L}4>0.15,"RED",IF({L}4>0.05,"AMBER","GREEN"))',
@@ -835,6 +839,11 @@ FORMULA_CODE_POINT = {
     "Unscientific Claims":               '=IF({L}4>=0.15,"RED","GREEN")',
     "Topics around Adult Health":        '=IF({L}2>0,"GREEN","RED")',
     "Topics on Adult Healthy Nutrition": '=IF({L}2>0,"GREEN","RED")',
+}
+
+# Columns that get count/total/% rows but NO Code/Point scoring (row 5 left blank)
+COUNT_ONLY_COLS = {
+    "Sugar Control",
 }
 
 # Background colours for the 4 formula rows
@@ -928,37 +937,41 @@ def write_influencer_sheet(wb, df, sheet_title, fmt):
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = bdr()
 
-            if col_name not in FORMULA_CODE_POINT and col_name != "response_1":
+            in_scored  = col_name in FORMULA_CODE_POINT
+            in_count   = col_name in COUNT_ONLY_COLS
+            if not in_scored and not in_count and col_name != "response_1":
                 # No formula for this column — leave empty
                 continue
 
-            if row_num == 2 and col_name in FORMULA_CODE_POINT:
+            if row_num == 2 and (in_scored or in_count):
                 # YES count
                 cell.value = f'=COUNTIFS({letter}{data_excel_start}:{letter}10000,"Yes")'
                 cell.number_format = "0"
 
-            elif row_num == 3 and col_name in FORMULA_CODE_POINT:
+            elif row_num == 3 and (in_scored or in_count):
                 # Total videos — use COUNTA of same column
                 cell.value = f'=COUNTA({letter}{data_excel_start}:{letter}10000)'
                 cell.number_format = "0"
 
-            elif row_num == 4 and col_name in FORMULA_CODE_POINT:
+            elif row_num == 4 and (in_scored or in_count):
                 # % prevalence
                 cell.value = f'=IFERROR({letter}2/{letter}3,0)'
                 cell.number_format = "0.00%"
 
-            elif row_num == 5 and col_name in FORMULA_CODE_POINT:
-                # Code/Point — apply threshold formula
+            elif row_num == 5 and in_scored:
+                # Code/Point — apply threshold formula (count-only cols get no score here)
                 template = FORMULA_CODE_POINT[col_name]
                 if template.startswith("="):
                     cell.value = template.replace("{L}", letter)
                 else:
                     cell.value = template  # e.g. "Check Manually for Competition"
-                # Colour the cell based on what it will evaluate to
-                # (we can't know at write-time so use neutral)
                 cell.fill = PatternFill("solid", fgColor="E2EFDA")
 
     # ── Rows 6+: data rows (use append for speed) ─────────────────────────
+    # CRITICAL: ws.append() uses _current_row which may not reflect ws.cell() writes.
+    # Explicitly set it so append starts at row 6, not row 1.
+    ws._current_row = data_excel_start - 1
+
     alt_fills = [
         PatternFill("solid", fgColor="FFFFFF"),
         PatternFill("solid", fgColor="F2F2F2"),
