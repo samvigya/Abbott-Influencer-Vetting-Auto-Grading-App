@@ -1,5 +1,5 @@
 """
-Abbott Influencer Vetting — Auto-Grader  v6.0
+Abbott Influencer Vetting — Auto-Grader  v6.1
 =============================================
 Changes in v6.0:
   1. Auto-reject gate values = 10 (not 1) when triggered
@@ -906,22 +906,65 @@ def write_influencer_sheet(wb, df, sheet_title, fmt):
         c.border = bdr()
         ws.column_dimensions[get_column_letter(i)].width = max(12, min(30, len(str(name)) + 2))
 
-    # ── Rows 2–5: formula rows ─────────────────────────────────────────────
+    # ── Pre-calculate row 2/3/4/5 values in Python (no Excel formula needed) ──
+    # This avoids Excel/Google Sheets recalculation issues with openpyxl files.
+    def _yes_count(col):
+        if col not in data_rows.columns: return 0
+        return int((data_rows[col].astype(str).str.strip().str.upper() == "YES").sum())
+
+    def _total(col):
+        if col not in data_rows.columns: return 0
+        s = data_rows[col].astype(str).str.strip().str.upper()
+        t = int(s.isin(["YES", "NO"]).sum())
+        return t if t > 0 else int(data_rows[col].notna().sum())
+
+    def _pct(col):
+        c, t = _yes_count(col), _total(col)
+        return round(c / t, 6) if t > 0 else 0.0
+
+    def _code(col_name, count, pct):
+        """Evaluate Code/Point threshold in Python — returns GREEN/AMBER/RED or text."""
+        if col_name not in FORMULA_CODE_POINT:
+            return None
+        t = FORMULA_CODE_POINT[col_name]
+        if not t.startswith("="):
+            return t   # e.g. "Check Manually for Competition"
+        # Relevance columns: count-based
+        if "{L}2" in t:
+            return "GREEN" if count > 0 else "RED"
+        # Risk columns: pct-based — parse thresholds from template
+        if "0.3" in t and "0.15" in t:
+            return "RED" if pct > 0.3 else ("AMBER" if pct > 0.15 else "GREEN")
+        if "0.15" in t and "0.05" in t:
+            return "RED" if pct > 0.15 else ("AMBER" if pct > 0.05 else "GREEN")
+        if ">=0.05" in t:
+            return "RED" if pct >= 0.05 else ("AMBER" if pct > 0 else "GREEN")
+        if "0.25" in t and "0.1" in t:
+            return "RED" if pct > 0.25 else ("AMBER" if pct > 0.1 else "GREEN")
+        if ">=0.15" in t:
+            return "RED" if pct >= 0.15 else "GREEN"
+        if "0.2" in t:
+            return "RED" if pct > 0.2 else "GREEN"
+        # Default: any occurrence = RED
+        return "RED" if pct > 0 else "GREEN"
+
+    # ── Rows 2–5: write pre-calculated values ─────────────────────────────
     row_labels = {
         2: ("response_1", "HEADER"),
         3: ("response_1", "Total Videos Processed"),
         4: ("response_1", "% Prevalence"),
         5: ("response_1", "Code/Point"),
     }
+    code_colors = {"GREEN": "375623", "AMBER": "806000", "RED": "C00000"}
     label_fill = PatternFill("solid", fgColor="2E75B6")
     label_font = Font(name=FN, bold=True, color="FFFFFF", size=9)
 
     for row_num in [2, 3, 4, 5]:
         ws.row_dimensions[row_num].height = 16
-        row_bg = PatternFill("solid", fgColor=ROW_COLORS[row_num])
+        row_bg  = PatternFill("solid", fgColor=ROW_COLORS[row_num])
         row_font = Font(name=FN, bold=True, size=9, color="000000")
 
-        # Label in response_1 col (col B typically)
+        # Label in response_1 col
         label_col, label_text = row_labels[row_num]
         if label_col in col_letter:
             lc = ws.cell(row_num, col_names.index(label_col) + 1, label_text)
@@ -937,35 +980,36 @@ def write_influencer_sheet(wb, df, sheet_title, fmt):
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = bdr()
 
-            in_scored  = col_name in FORMULA_CODE_POINT
-            in_count   = col_name in COUNT_ONLY_COLS
+            in_scored = col_name in FORMULA_CODE_POINT
+            in_count  = col_name in COUNT_ONLY_COLS
             if not in_scored and not in_count and col_name != "response_1":
-                # No formula for this column — leave empty
                 continue
 
             if row_num == 2 and (in_scored or in_count):
-                # YES count
-                cell.value = f'=COUNTIFS({letter}{data_excel_start}:{letter}10000,"Yes")'
+                cell.value = _yes_count(col_name)
                 cell.number_format = "0"
 
             elif row_num == 3 and (in_scored or in_count):
-                # Total videos — use COUNTA of same column
-                cell.value = f'=COUNTA({letter}{data_excel_start}:{letter}10000)'
+                cell.value = _total(col_name)
                 cell.number_format = "0"
 
             elif row_num == 4 and (in_scored or in_count):
-                # % prevalence
-                cell.value = f'=IFERROR({letter}2/{letter}3,0)'
+                cell.value = _pct(col_name)
                 cell.number_format = "0.00%"
 
             elif row_num == 5 and in_scored:
-                # Code/Point — apply threshold formula (count-only cols get no score here)
-                template = FORMULA_CODE_POINT[col_name]
-                if template.startswith("="):
-                    cell.value = template.replace("{L}", letter)
+                cnt = _yes_count(col_name)
+                pct = _pct(col_name)
+                code_val = _code(col_name, cnt, pct)
+                cell.value = code_val
+                # Colour the cell by result
+                if code_val in code_colors:
+                    cell.fill = PatternFill("solid", fgColor="E2EFDA" if code_val=="GREEN"
+                                            else ("FFF2CC" if code_val=="AMBER" else "FFCCCC"))
+                    cell.font = Font(name=FN, bold=True, size=9,
+                                     color=code_colors.get(code_val, "000000"))
                 else:
-                    cell.value = template  # e.g. "Check Manually for Competition"
-                cell.fill = PatternFill("solid", fgColor="E2EFDA")
+                    cell.fill = PatternFill("solid", fgColor="E2EFDA")
 
     # ── Rows 6+: data rows (use append for speed) ─────────────────────────
     # CRITICAL: ws.append() uses _current_row which may not reflect ws.cell() writes.
