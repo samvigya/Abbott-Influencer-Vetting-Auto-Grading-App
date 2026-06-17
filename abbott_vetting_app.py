@@ -1,7 +1,7 @@
 """
-Abbott Influencer Vetting — Auto-Grader  v6.2
+Abbott Influencer Vetting — Auto-Grader  v6.0
 =============================================
-Changes in v6.2:
+Changes in v6.0:
   1. Auto-reject gate values = 10 (not 1) when triggered
   2. Multiple platform file uploads — each labelled by platform, composite grading output
   3. Reads pre-filled manual scores from existing Grading sheet in uploaded file (optional)
@@ -1145,8 +1145,20 @@ st.markdown("""<style>
 div[data-testid='stExpander']{border:1px solid #e0e0e0;border-radius:6px;}
 </style>""",unsafe_allow_html=True)
 
-st.title("🏥 Abbott Influencer Vetting — Auto-Grader v6.2")
+st.title("🏥 Abbott Influencer Vetting — Auto-Grader v6.1")
 st.caption("Upload multiple platform files → auto-score → composite grading | Pre-filled manual scores supported")
+st.divider()
+
+# ── Use Case Selector ──────────────────────────────────────────────────────
+st.subheader("🎯 Select Use Case")
+use_case_choice = st.radio(
+    "Which nutrition category are you vetting for?",
+    options=["Pediatric Nutrition", "Adult Nutrition"],
+    horizontal=True,
+    key="use_case_selector"
+)
+use_case = "Adult" if "Adult" in use_case_choice else "Pediatric"
+st.caption(f"Scoring will apply **{use_case}** relevance parameters to all uploaded files.")
 st.divider()
 
 # ── Dynamic multi-file upload ──────────────────────────────────────────────
@@ -1190,7 +1202,6 @@ Each file can contain influencer sheets for one platform (TT, FB, IG etc.) or mi
 Label each with its platform — this becomes the tab name in the output Excel.
 
 **Auto-detects:**
-- Use case (Pediatric vs Adult) from column content
 - Sheet format (aggregated vs Yes/No rows vs FB Verdict format)
 - Pre-filled manual scores from any existing Grading sheet in the file
 
@@ -1206,14 +1217,11 @@ Label each with its platform — this becomes the tab name in the output Excel.
 
 else:
     with st.spinner("Reading files…"):
-        # Determine use case from first file that can detect it
-        use_case = "Pediatric"
+        # use_case already set above by the radio selector — no auto-detection
         profiles = {}
         for _, f in uploaded_files:
             xl_tmp = pd.read_excel(f, sheet_name=None)
             f.seek(0)
-            uc_tmp = detect_use_case(xl_tmp)
-            if uc_tmp == "Adult": use_case = "Adult"; break
             prf_tmp = build_profiles(xl_tmp)
             if prf_tmp: profiles.update(prf_tmp)
 
