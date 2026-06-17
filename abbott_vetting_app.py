@@ -1,7 +1,7 @@
 """
-Abbott Influencer Vetting — Auto-Grader  v6.1
+Abbott Influencer Vetting — Auto-Grader  v6.2
 =============================================
-Changes in v6.0:
+Changes in v6.2:
   1. Auto-reject gate values = 10 (not 1) when triggered
   2. Multiple platform file uploads — each labelled by platform, composite grading output
   3. Reads pre-filled manual scores from existing Grading sheet in uploaded file (optional)
@@ -819,9 +819,8 @@ def build_excel(platform_scores_map, use_case, profiles):
 # {L} = placeholder for the actual Excel column letter.
 # Kids/Topics/Media: use row 2 (count) directly since binary presence check.
 # Risk params: use row 4 (% prevalence) with threshold formulas.
-FORMULA_CODE_POINT = {
-    "Kids Presenence":                   '=IF({L}2>0,"GREEN","RED")',
-    "Kids Growth":                        '=IF({L}2>0,"GREEN","RED")',
+# Columns shared by BOTH use cases (risk params + auto-reject + shared relevance)
+FORMULA_CODE_POINT_SHARED = {
     "Brand Partnership Presence":         "Check Manually for Competition",
     "Media Presence & Awards":           '=IF({L}2>0,"GREEN","RED")',
     "Alcohol Use Discussion":            '=IF({L}4>0.15,"RED",IF({L}4>0.05,"AMBER","GREEN"))',
@@ -837,9 +836,31 @@ FORMULA_CODE_POINT = {
     "Political Stance":                  '=IF({L}4>0.25,"RED",IF({L}4>0.1,"AMBER","GREEN"))',
     "Breastfeeding":                     '=IF({L}4>0,"RED","GREEN")',
     "Unscientific Claims":               '=IF({L}4>=0.15,"RED","GREEN")',
+}
+
+# Pediatric-ONLY relevance columns
+FORMULA_CODE_POINT_PEDIATRIC = {
+    "Kids Presenence":                   '=IF({L}2>0,"GREEN","RED")',
+    "Kids Growth":                       '=IF({L}2>0,"GREEN","RED")',
+}
+
+# Adult-ONLY relevance columns
+FORMULA_CODE_POINT_ADULT = {
     "Topics around Adult Health":        '=IF({L}2>0,"GREEN","RED")',
     "Topics on Adult Healthy Nutrition": '=IF({L}2>0,"GREEN","RED")',
 }
+
+def get_formula_code_point(use_case):
+    """Return the active column→formula map for the selected use case only."""
+    d = dict(FORMULA_CODE_POINT_SHARED)
+    if use_case == "Pediatric":
+        d.update(FORMULA_CODE_POINT_PEDIATRIC)
+    else:
+        d.update(FORMULA_CODE_POINT_ADULT)
+    return d
+
+# Backwards-compat alias (kept so any stray references don't crash; not used for scoring)
+FORMULA_CODE_POINT = {**FORMULA_CODE_POINT_SHARED, **FORMULA_CODE_POINT_PEDIATRIC, **FORMULA_CODE_POINT_ADULT}
 
 # Columns that get count/total/% rows but NO Code/Point scoring (row 5 left blank)
 COUNT_ONLY_COLS = {
@@ -855,7 +876,7 @@ ROW_COLORS = {
 }
 
 
-def write_influencer_sheet(wb, df, sheet_title, fmt):
+def write_influencer_sheet(wb, df, sheet_title, fmt, use_case="Pediatric"):
     """
     Write one influencer's raw data sheet into the workbook.
 
@@ -908,6 +929,9 @@ def write_influencer_sheet(wb, df, sheet_title, fmt):
 
     # ── Pre-calculate row 2/3/4/5 values in Python (no Excel formula needed) ──
     # This avoids Excel/Google Sheets recalculation issues with openpyxl files.
+    # Only columns relevant to the SELECTED use case get Code/Point scoring.
+    active_fcp = get_formula_code_point(use_case)
+
     def _yes_count(col):
         if col not in data_rows.columns: return 0
         return int((data_rows[col].astype(str).str.strip().str.upper() == "YES").sum())
@@ -924,9 +948,9 @@ def write_influencer_sheet(wb, df, sheet_title, fmt):
 
     def _code(col_name, count, pct):
         """Evaluate Code/Point threshold in Python — returns GREEN/AMBER/RED or text."""
-        if col_name not in FORMULA_CODE_POINT:
+        if col_name not in active_fcp:
             return None
-        t = FORMULA_CODE_POINT[col_name]
+        t = active_fcp[col_name]
         if not t.startswith("="):
             return t   # e.g. "Check Manually for Competition"
         # Relevance columns: count-based
@@ -980,7 +1004,7 @@ def write_influencer_sheet(wb, df, sheet_title, fmt):
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = bdr()
 
-            in_scored = col_name in FORMULA_CODE_POINT
+            in_scored = col_name in active_fcp
             in_count  = col_name in COUNT_ONLY_COLS
             if not in_scored and not in_count and col_name != "response_1":
                 continue
@@ -1100,7 +1124,7 @@ def build_excel_with_sheets(platform_scores_map, use_case, profiles,
                 # Sheet title: use original sheet name, truncated to 31 chars
                 sheet_title = sn[:31]
                 try:
-                    write_influencer_sheet(wb, df, sheet_title, fmt)
+                    write_influencer_sheet(wb, df, sheet_title, fmt, use_case)
                 except Exception as e:
                     # Never crash the whole build for one bad sheet
                     pass
@@ -1121,7 +1145,7 @@ st.markdown("""<style>
 div[data-testid='stExpander']{border:1px solid #e0e0e0;border-radius:6px;}
 </style>""",unsafe_allow_html=True)
 
-st.title("🏥 Abbott Influencer Vetting — Auto-Grader v6.0")
+st.title("🏥 Abbott Influencer Vetting — Auto-Grader v6.2")
 st.caption("Upload multiple platform files → auto-score → composite grading | Pre-filled manual scores supported")
 st.divider()
 
